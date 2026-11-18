@@ -106,34 +106,42 @@ class AIEngineService:
     ) -> None:
         self.provider = (provider or settings.ai_provider or "gemini").lower()
 
-        # Resolve API key (supports GEMINI_API_KEY and OPENAI_API_KEY)
+        # Resolve API key, model and base URL per provider
         if api_key is not None:
-            self.api_key = api_key
-        elif self.provider == "gemini" and (settings.gemini_api_key or os.getenv("GEMINI_API_KEY")):
-            self.api_key = settings.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-        else:
+            self.api_key = api_key.strip().strip("'\"")
+        elif self.provider == "gemini":
             self.api_key = (
                 settings.gemini_api_key
-                or os.getenv("GEMINI_API_KEY")
-                or settings.openai_api_key
+                or os.getenv("GEMINI_API_KEY", "")
+            ).strip().strip("'\"")
+        else:
+            self.api_key = (
+                settings.openai_api_key
                 or os.getenv("OPENAI_API_KEY", "")
-            )
+            ).strip().strip("'\"")
 
-        # Auto-detect Gemini key format (e.g. starts with "AQ." or "AIzaSy")
-        if self.api_key.startswith("AQ.") or self.api_key.startswith("AIzaSy"):
-            self.provider = "gemini"
-
-        # Resolve Base URL and default Model
         if self.provider == "gemini":
             self.base_url = (
                 base_url
                 or settings.gemini_base_url
                 or "https://generativelanguage.googleapis.com/v1beta/openai/"
             )
-            self.model = model or settings.gemini_model or "models/gemma-4-26b-a4b-it"
+            self.model = model or settings.gemini_model or "gemini-flash-lite-latest"
         else:
             self.base_url = base_url or settings.openai_base_url or None
             self.model = model or settings.openai_model or "gpt-4o-mini"
+
+        # Auto-detect key format if mismatched
+        if self.api_key.startswith("AQ.") or self.api_key.startswith("AIzaSy"):
+            self.provider = "gemini"
+            if not base_url and not settings.gemini_base_url:
+                self.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            if not model and not settings.gemini_model:
+                self.model = "gemini-flash-lite-latest"
+        elif self.api_key.startswith("sk-") and self.provider != "openai":
+            self.provider = "openai"
+            if not model:
+                self.model = "gpt-4o-mini"
 
         self.max_tokens = settings.openai_max_tokens
         self.timeout = settings.openai_timeout_seconds
@@ -339,8 +347,8 @@ class AIEngineService:
             raw_content = await self._call_openai_with_retry(messages)
             return self._parse_analysis_json(raw_content)
 
-        # Local mock fallback
-        return self._build_mock_analysis(worker_id, additional_prompt)
+        # Local mock fallback with provider-aware guidance
+        return self._build_mock_analysis(worker_id, additional_prompt, provider=self.provider)
 
     # ------------------------------------------------------------------
     # Legacy free-text analysis (kept for backward compatibility)
@@ -388,11 +396,12 @@ class AIEngineService:
             )
 
         # Fallback local guidance when API key is not yet set
+        key_name = "GEMINI_API_KEY" if self.provider == "gemini" else "OPENAI_API_KEY"
         return AIAnalysisResponse(
             worker_id=request.worker_id,
             explanation=(
                 f"[Local Simulation Engine]: Analysis for question '{request.prompt}'. "
-                "To connect live GPT-4o vision analysis, provide OPENAI_API_KEY in your .env file."
+                f"To connect live {self.provider.title()} vision analysis, provide {key_name} in your .env file."
             ),
             suggested_code="# Suggested template:\ndef solve_problem():\n    pass\n",
             requires_student_review=True,
@@ -449,30 +458,82 @@ class AIEngineService:
         return CodingAnalysisResult(**data)
 
     @staticmethod
-    def _build_mock_analysis(worker_id: str, prompt: str = "") -> CodingAnalysisResult:
-        """Build a mock CodingAnalysisResult for local testing without API key."""
-        return CodingAnalysisResult(
-            problem_title="[Mock] Screen Analysis",
-            problem_description=(
-                "OPENAI_API_KEY is not configured. This is a simulated analysis response.\n"
+    def _build_mock_analysis(
+        worker_id: str, prompt: str = "", provider: str = "gemini"
+    ) -> CodingAnalysisResult:
+        """Build a mock CodingAnalysisResult for local testing when API key is not configured."""
+        if provider == "gemini":
+            title = "[Mock] Gemini Vision Analysis"
+            desc = (
+                "GEMINI_API_KEY is not configured in your .env file. This is a simulated analysis response.\n"
+                "To enable live Gemini multimodal vision analysis, add your GEMINI_API_KEY to the .env file."
+            )
+            concepts = ["Configure GEMINI_API_KEY", "Gemini Multimodal Vision API"]
+            steps = [
+                "Step 1: Open your project-root .env file",
+                "Step 2: Set GEMINI_API_KEY=your-gemini-key",
+                "Step 3: Ensure AI_PROVIDER=gemini",
+                "Step 4: Restart the worker application and click 'Analyze Screen'",
+            ]
+            code = (
+                "# Configure your .env file:\n"
+                "# AI_PROVIDER=gemini\n"
+                "# GEMINI_API_KEY=your-gemini-key\n"
+                "# GEMINI_MODEL=gemini-flash-lite-latest\n"
+            )
+            explanation = "Set the GEMINI_API_KEY environment variable to enable live Gemini analysis."
+            key_name = "GEMINI_API_KEY"
+        elif provider == "openai":
+            title = "[Mock] OpenAI Vision Analysis"
+            desc = (
+                "OPENAI_API_KEY is not configured in your .env file. This is a simulated analysis response.\n"
                 "To enable live AI-powered screen analysis, add your OpenAI API key to the .env file."
-            ),
-            programming_language="Python",
-            relevant_concepts=["Configure OPENAI_API_KEY", "Vision API integration"],
-            step_by_step_explanation=[
-                "Step 1: Copy .env.example to .env",
+            )
+            concepts = ["Configure OPENAI_API_KEY", "OpenAI Vision API integration"]
+            steps = [
+                "Step 1: Open your project-root .env file",
                 "Step 2: Set OPENAI_API_KEY=sk-...",
-                "Step 3: Restart the worker application",
-                "Step 4: Click 'Analyze Screen' again",
-            ],
-            suggested_code="# Configure your .env file:\n# OPENAI_API_KEY=sk-your-key-here\n# OPENAI_MODEL=gpt-4o\n",
-            code_explanation="Set the OPENAI_API_KEY environment variable to enable live AI analysis.",
+                "Step 3: Ensure AI_PROVIDER=openai",
+                "Step 4: Restart the worker application and click 'Analyze Screen'",
+            ]
+            code = (
+                "# Configure your .env file:\n"
+                "# AI_PROVIDER=openai\n"
+                "# OPENAI_API_KEY=sk-your-key-here\n"
+                "# OPENAI_MODEL=gpt-4o-mini\n"
+            )
+            explanation = "Set the OPENAI_API_KEY environment variable to enable live AI analysis."
+            key_name = "OPENAI_API_KEY"
+        else:
+            title = "[Configuration Error] AI Provider Not Configured"
+            desc = (
+                f"Provider '{provider}' is not configured or unsupported.\n"
+                "Please configure AI_PROVIDER (gemini or openai) and the corresponding API key in your .env file."
+            )
+            concepts = ["Configure AI_PROVIDER", "Configure API Key"]
+            steps = [
+                "Step 1: Set AI_PROVIDER=gemini in .env",
+                "Step 2: Set GEMINI_API_KEY=your-key in .env",
+                "Step 3: Restart worker",
+            ]
+            code = "# Set AI_PROVIDER=gemini\n# GEMINI_API_KEY=your-key\n"
+            explanation = "Configure valid AI provider credentials."
+            key_name = "AI_API_KEY"
+
+        return CodingAnalysisResult(
+            problem_title=title,
+            problem_description=desc,
+            programming_language="Python",
+            relevant_concepts=concepts,
+            step_by_step_explanation=steps,
+            suggested_code=code,
+            code_explanation=explanation,
             edge_cases=[
                 EdgeCase(
-                    description="No API key configured",
-                    example_input="OPENAI_API_KEY=",
-                    expected_behavior="Falls back to this mock response",
+                    description=f"No {key_name} configured",
+                    example_input=f"{key_name}=",
+                    expected_behavior="Falls back to this provider-aware mock response",
                 )
             ],
-            confidence_note="Mock response — no live API call was made.",
+            confidence_note=f"Mock response for provider '{provider}' — no live API call was made.",
         )

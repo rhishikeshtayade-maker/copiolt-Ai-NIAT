@@ -9,6 +9,7 @@ from PySide6.QtCore import QByteArray, QDateTime, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTextEdit,
@@ -33,7 +35,7 @@ from src.common.schemas import CodingAnalysisResult
 from src.desktop.components.preview_widget import ScreenPreviewWidget
 from src.desktop.components.status_bar import ConnectionStatusBar
 from src.worker.ai_engine import AIEngineService
-from src.worker.capture import ScreenCaptureService
+from src.worker.capture import ScreenCaptureService, list_capturable_windows
 from src.worker.client import WorkerClient
 
 logger = get_logger("Desktop.App")
@@ -218,6 +220,77 @@ class MainWindow(QMainWindow):
         left_widget = QWidget()
         left_column = QVBoxLayout(left_widget)
         left_column.setContentsMargins(0, 0, 0, 0)
+
+        # Screen Capture Target Selection (Window / Region / Full Screen)
+        target_group = QGroupBox("Screen Capture Target (Window / Region Selection)")
+        target_layout = QVBoxLayout(target_group)
+
+        # Target Mode combo
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Target:"))
+        self.target_mode_combo = QComboBox()
+        self.target_mode_combo.addItem("Full Screen (Primary Monitor)", "monitor")
+        self.target_mode_combo.addItem("Application Window", "window")
+        self.target_mode_combo.addItem("Rectangular Region", "region")
+        self.target_mode_combo.currentIndexChanged.connect(self.on_target_mode_changed)
+        mode_layout.addWidget(self.target_mode_combo, 1)
+        target_layout.addLayout(mode_layout)
+
+        # Window selection row
+        self.window_selection_widget = QWidget()
+        win_layout = QHBoxLayout(self.window_selection_widget)
+        win_layout.setContentsMargins(0, 0, 0, 0)
+        win_layout.addWidget(QLabel("Window:"))
+        self.window_combo = QComboBox()
+        self.window_combo.currentIndexChanged.connect(self.on_window_selected)
+        win_layout.addWidget(self.window_combo, 1)
+        self.refresh_windows_btn = QPushButton("🔄 Refresh")
+        self.refresh_windows_btn.setFixedWidth(80)
+        self.refresh_windows_btn.clicked.connect(self.refresh_window_list)
+        win_layout.addWidget(self.refresh_windows_btn)
+        self.window_selection_widget.setVisible(False)
+        target_layout.addWidget(self.window_selection_widget)
+
+        # Region selection row
+        self.region_selection_widget = QWidget()
+        reg_layout = QHBoxLayout(self.region_selection_widget)
+        reg_layout.setContentsMargins(0, 0, 0, 0)
+        reg_layout.addWidget(QLabel("X:"))
+        self.region_x_spin = QSpinBox()
+        self.region_x_spin.setRange(0, 10000)
+        self.region_x_spin.setValue(0)
+        self.region_x_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
+        reg_layout.addWidget(self.region_x_spin)
+
+        reg_layout.addWidget(QLabel("Y:"))
+        self.region_y_spin = QSpinBox()
+        self.region_y_spin.setRange(0, 10000)
+        self.region_y_spin.setValue(0)
+        self.region_y_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
+        reg_layout.addWidget(self.region_y_spin)
+
+        reg_layout.addWidget(QLabel("W:"))
+        self.region_w_spin = QSpinBox()
+        self.region_w_spin.setRange(10, 10000)
+        self.region_w_spin.setValue(1280)
+        self.region_w_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
+        reg_layout.addWidget(self.region_w_spin)
+
+        reg_layout.addWidget(QLabel("H:"))
+        self.region_h_spin = QSpinBox()
+        self.region_h_spin.setRange(10, 10000)
+        self.region_h_spin.setValue(720)
+        self.region_h_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
+        reg_layout.addWidget(self.region_h_spin)
+        self.region_selection_widget.setVisible(False)
+        target_layout.addWidget(self.region_selection_widget)
+
+        # Approved frame status label
+        self.approved_frame_label = QLabel("Approved Frame: None (Click 'Capture Single Preview' to prepare)")
+        self.approved_frame_label.setStyleSheet("color: #ffb74d; font-size: 11px;")
+        target_layout.addWidget(self.approved_frame_label)
+
+        left_column.addWidget(target_group)
 
         controls_group = QGroupBox("Execution Controls")
         btn_layout = QVBoxLayout(controls_group)
@@ -503,15 +576,67 @@ class MainWindow(QMainWindow):
             self.preview_btn.setEnabled(True)
             self.analyze_btn.setEnabled(True)
             self.preview_widget.set_placeholder("Ready to capture. Click 'Start' or 'Capture Single Preview'.")
+            self.approved_frame_label.setText("Approved Frame: None (Click 'Capture Single Preview' to prepare)")
+            self.approved_frame_label.setStyleSheet("color: #ffb74d; font-size: 11px;")
             self.append_log("User GRANTED explicit screen capture permission.")
         else:
             self.start_btn.setEnabled(False)
             self.preview_btn.setEnabled(False)
             self.analyze_btn.setEnabled(False)
+            self.capture_service.clear_approved_frame()
+            self.approved_frame_label.setText("Approved Frame: Revoked (No Consent)")
+            self.approved_frame_label.setStyleSheet("color: #888888; font-size: 11px;")
             if self.capture_service.has_permission:
                 self.on_stop_clicked()
             self.preview_widget.set_placeholder("Screen Capture Inactive\n(Explicit user consent required)")
             self.append_log("User REVOKED screen capture permission.")
+
+    def on_target_mode_changed(self, index: int) -> None:
+        """Handle target mode switch between monitor, window, and custom region."""
+        mode = self.target_mode_combo.currentData()
+        self.window_selection_widget.setVisible(mode == "window")
+        self.region_selection_widget.setVisible(mode == "region")
+        if mode == "window":
+            self.refresh_window_list()
+        self._apply_capture_targeting()
+
+    def refresh_window_list(self) -> None:
+        """Populate the window dropdown with open capturable windows, excluding NIAT CodePilot."""
+        self.window_combo.blockSignals(True)
+        self.window_combo.clear()
+        windows = list_capturable_windows(exclude_titles=("NIAT CodePilot",))
+        if not windows:
+            self.window_combo.addItem("No capturable windows found", None)
+        else:
+            for w in windows:
+                title = w["title"]
+                hwnd = w["hwnd"]
+                rect = w["rect"]
+                w_w = max(0, rect[2] - rect[0])
+                w_h = max(0, rect[3] - rect[1])
+                self.window_combo.addItem(f"{title[:40]} ({w_w}x{w_h})", hwnd)
+        self.window_combo.blockSignals(False)
+        self._apply_capture_targeting()
+
+    def on_window_selected(self, index: int) -> None:
+        """Handle selection of a different application window."""
+        self._apply_capture_targeting()
+
+    def _apply_capture_targeting(self) -> None:
+        """Propagate current UI target selection into the ScreenCaptureService."""
+        mode = self.target_mode_combo.currentData() or "monitor"
+        if mode == "window":
+            hwnd = self.window_combo.currentData()
+            title = self.window_combo.currentText()
+            self.capture_service.set_target_mode("window", window_hwnd=hwnd, window_title=title)
+        elif mode == "region":
+            x = self.region_x_spin.value()
+            y = self.region_y_spin.value()
+            w = self.region_w_spin.value()
+            h = self.region_h_spin.value()
+            self.capture_service.set_target_mode("region", region_rect=(x, y, w, h))
+        else:
+            self.capture_service.set_target_mode("monitor", monitor_index=1)
 
     def on_start_clicked(self) -> None:
         """Start worker registration, screen capture engine, and heartbeat loop."""
@@ -616,40 +741,64 @@ class MainWindow(QMainWindow):
 
         self.preview_widget.set_placeholder("EMERGENCY STOP ACTIVATED\nAll screen capture instantly terminated.", is_emergency=True)
         self.preview_info_label.setText("Status: EMERGENCY STOPPED")
+        self.approved_frame_label.setText("Approved Frame: Cleared (Emergency Stop)")
+        self.approved_frame_label.setStyleSheet("color: #d32f2f; font-size: 11px; font-weight: bold;")
         self.status_bar.set_permission_status(False)
         self.status_bar.set_connection_status(False, "Emergency Halted")
 
         self.append_log("EMERGENCY STOP TRIGGERED. All permissions and capture loops terminated immediately.")
 
     def on_single_preview_clicked(self) -> None:
-        """Capture and display a single frame on-demand."""
+        """Capture and display a single frame on-demand and register as approved frame."""
+        self._apply_capture_targeting()
         try:
-            png_bytes, meta = self.capture_service.capture_frame_bytes()
-            qimage = QImage.fromData(QByteArray(png_bytes))
+            b64_jpeg, meta = self.capture_service.capture_jpeg_base64(quality=settings.openai_jpeg_quality)
+            raw_bytes = base64.b64decode(b64_jpeg)
+            qimage = QImage.fromData(QByteArray(raw_bytes))
             pixmap = QPixmap.fromImage(qimage)
-            self.preview_widget.update_frame(pixmap, f"Frame: {meta.width}x{meta.height} ({meta.frame_size_bytes} bytes)")
+            self.preview_widget.update_frame(pixmap, f"Target: {self.capture_service.target_mode.upper()} | {meta.width}x{meta.height}")
             self.preview_info_label.setText(
-                f"Resolution: {meta.width}x{meta.height} | Size: {meta.frame_size_bytes / 1024:.1f} KB | Verified: Explicit Consent"
+                f"Mode: {self.capture_service.target_mode.upper()} | Resolution: {meta.width}x{meta.height} | "
+                f"Size: {meta.frame_size_bytes / 1024:.1f} KB | Verified: Explicit Consent"
             )
-            self.append_log(f"Captured single frame preview ({meta.width}x{meta.height}, {meta.frame_size_bytes} bytes)")
+            self.approved_frame_label.setText(
+                f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Ready for AI"
+            )
+            self.approved_frame_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
+            self.append_log(f"Captured single frame preview ({self.capture_service.target_mode.upper()}, {meta.width}x{meta.height}, {meta.frame_size_bytes} bytes)")
         except PermissionError as pe:
             QMessageBox.warning(self, "Permission Denied", str(pe))
             self.append_log(f"Permission error: {pe}")
         except Exception as e:
             self.append_log(f"Preview capture failed: {e}")
+            self.approved_frame_label.setText(f"Capture Failed: {e}")
+            self.approved_frame_label.setStyleSheet("color: #f44336; font-size: 11px; font-weight: bold;")
+            QMessageBox.warning(
+                self,
+                "Window Capture Failed",
+                f"Could not capture application window:\n\n{e}\n\n"
+                "Please ensure the application window is open, unminimized, and visible on your screen, then try again.",
+            )
 
     def on_auto_preview_tick(self) -> None:
         """Periodically grab a preview frame when worker is actively running."""
         if not self.capture_service.has_permission:
             return
+        self._apply_capture_targeting()
         try:
-            png_bytes, meta = self.capture_service.capture_frame_bytes()
-            qimage = QImage.fromData(QByteArray(png_bytes))
+            b64_jpeg, meta = self.capture_service.capture_jpeg_base64(quality=settings.openai_jpeg_quality)
+            raw_bytes = base64.b64decode(b64_jpeg)
+            qimage = QImage.fromData(QByteArray(raw_bytes))
             pixmap = QPixmap.fromImage(qimage)
             self.preview_widget.update_frame(pixmap)
             self.preview_info_label.setText(
-                f"Resolution: {meta.width}x{meta.height} | Size: {meta.frame_size_bytes / 1024:.1f} KB | Active Preview"
+                f"Mode: {self.capture_service.target_mode.upper()} | Resolution: {meta.width}x{meta.height} | "
+                f"Size: {meta.frame_size_bytes / 1024:.1f} KB | Active Preview"
             )
+            self.approved_frame_label.setText(
+                f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Auto Updated"
+            )
+            self.approved_frame_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
         except Exception as e:
             self.append_log(f"Auto preview tick error: {e}")
 
@@ -657,7 +806,7 @@ class MainWindow(QMainWindow):
     # AI Screen Analysis
     # ------------------------------------------------------------------
     def on_analyze_screen_clicked(self) -> None:
-        """Capture a JPEG screenshot and send it for AI analysis."""
+        """Analyze the approved screen capture frame using the configured AI provider."""
         if not self.consent_checkbox.isChecked():
             QMessageBox.warning(
                 self,
@@ -666,11 +815,52 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Confirm student intent
+        self._apply_capture_targeting()
+
+        # Single source of truth: retrieve the current approved frame or capture one
+        approved = self.capture_service.get_last_approved_frame()
+        if approved is None:
+            if not self.capture_service._is_active:
+                try:
+                    self.capture_service.start()
+                except PermissionError as pe:
+                    QMessageBox.warning(self, "Permission Denied", str(pe))
+                    return
+
+            try:
+                b64_jpeg, meta = self.capture_service.capture_jpeg_base64(
+                    quality=settings.openai_jpeg_quality,
+                )
+                approved = (b64_jpeg, meta)
+                raw_bytes = base64.b64decode(b64_jpeg)
+                qimage = QImage.fromData(QByteArray(raw_bytes))
+                self.preview_widget.update_frame(QPixmap.fromImage(qimage), f"Captured: {meta.width}x{meta.height}")
+                self.approved_frame_label.setText(
+                    f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Ready for AI"
+                )
+                self.approved_frame_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
+            except Exception as e:
+                self.append_log(f"Screenshot capture for AI failed: {e}")
+                self.approved_frame_label.setText(f"Capture Failed: {e}")
+                self.approved_frame_label.setStyleSheet("color: #f44336; font-size: 11px; font-weight: bold;")
+                QMessageBox.critical(
+                    self,
+                    "Window Capture Failed",
+                    f"Failed to capture application window for AI analysis:\n\n{e}\n\n"
+                    "Please ensure the window is open, unminimized, and visible on your screen, or select another window.",
+                )
+                return
+
+        b64_jpeg, meta = approved
+        provider_name = settings.ai_provider.upper()
+
+        # Confirm student intent referencing the exact frame and provider
         reply = QMessageBox.question(
             self,
-            "Confirm AI Screen Analysis",
-            "This will capture your current screen and send it to the OpenAI API for coding analysis.\n\n"
+            f"Confirm AI Screen Analysis ({provider_name})",
+            f"This will send the approved screen capture ({meta.width}x{meta.height}, {meta.frame_size_bytes / 1024:.1f} KB)\n"
+            f"to the configured AI provider ({provider_name}) for coding analysis.\n\n"
+            "• Both the preview and AI analysis use this identical captured frame.\n"
             "• No passwords or personal data will be transmitted.\n"
             "• No automatic portal submissions will be made.\n"
             "• You must review all suggestions before using them.\n\n"
@@ -682,28 +872,8 @@ class MainWindow(QMainWindow):
             self.append_log("AI analysis cancelled by student.")
             return
 
-        # Ensure capture service is ready
-        if not self.capture_service._is_active:
-            # Allow one-shot capture without full start
-            try:
-                self.capture_service.start()
-            except PermissionError as pe:
-                QMessageBox.warning(self, "Permission Denied", str(pe))
-                return
-
-        # Capture JPEG screenshot
-        try:
-            b64_jpeg, meta = self.capture_service.capture_jpeg_base64(
-                quality=settings.openai_jpeg_quality,
-            )
-        except Exception as e:
-            self.append_log(f"Screenshot capture for AI failed: {e}")
-            QMessageBox.critical(self, "Capture Error", f"Failed to capture screenshot:\n{e}")
-            return
-
         self.append_log(
-            f"Captured JPEG for AI analysis ({meta.width}x{meta.height}, "
-            f"{meta.frame_size_bytes / 1024:.1f} KB)"
+            f"Submitting approved frame ({meta.width}x{meta.height}, {meta.frame_size_bytes / 1024:.1f} KB) to {provider_name}..."
         )
 
         # Show loading state

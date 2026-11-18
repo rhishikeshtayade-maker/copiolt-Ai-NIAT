@@ -595,3 +595,36 @@ class TestGeminiVisionRealIntegration:
         assert result.requires_student_review is True
         assert result.auto_submission_permitted is False
 
+
+class TestProviderAwareness:
+    def test_gemini_provider_mock_message(self):
+        """When AI_PROVIDER is gemini but no key is set, mock guidance must cite GEMINI_API_KEY."""
+        engine = AIEngineService(api_key="", provider="gemini")
+        assert engine.is_configured is False
+        mock = engine._build_mock_analysis("w1", "test prompt", provider="gemini")
+        assert "GEMINI_API_KEY is not configured in your .env file" in mock.problem_description
+        assert "OPENAI_API_KEY" not in mock.problem_description
+        assert "GEMINI_API_KEY=your-gemini-key" in mock.suggested_code
+
+    def test_openai_provider_mock_message(self):
+        """When AI_PROVIDER is openai but no key is set, mock guidance must cite OPENAI_API_KEY."""
+        engine = AIEngineService(api_key="", provider="openai")
+        assert engine.is_configured is False
+        mock = engine._build_mock_analysis("w1", "test prompt", provider="openai")
+        assert "OPENAI_API_KEY is not configured" in mock.problem_description
+        assert "GEMINI_API_KEY" not in mock.problem_description
+
+    def test_unconfigured_provider_error_message(self):
+        """When provider is unconfigured or invalid, show a clear configuration error."""
+        engine = AIEngineService(api_key="", provider="unknown_provider")
+        assert engine.is_configured is False
+        mock = engine._build_mock_analysis("w1", "test prompt", provider="unknown_provider")
+        assert "[Configuration Error] AI Provider Not Configured" in mock.problem_title
+        assert "AI_PROVIDER" in mock.problem_description
+
+    def test_gemini_provider_defaults(self):
+        """Verify Gemini provider configures correct endpoint and flash lite model."""
+        engine = AIEngineService(api_key="test-key", provider="gemini")
+        assert engine.model == "gemini-flash-lite-latest"
+        assert "generativelanguage.googleapis.com" in engine.base_url
+        assert engine.is_configured is True
