@@ -23,18 +23,40 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.common.logger import get_logger
+
+logger = get_logger("Desktop.PracticeEditor")
+
 
 class PracticeEditorWindow(QMainWindow):
     """Dedicated local practice editor window for safe, authorized computer-use testing."""
 
     text_changed_signal = Signal(str)
+    closed_signal = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+        )
         self.setWindowTitle("NIAT Local Practice Editor — Authorized Practice Environment")
         self.resize(750, 520)
+        self.setMinimumSize(500, 360)
         self._init_ui()
         self._apply_editor_styles()
+        logger.info("Initialized PracticeEditorWindow (HWND pending/show).")
+
+    def closeEvent(self, event) -> None:
+        logger.info("NIAT Local Practice Editor window closeEvent invoked.")
+        self.closed_signal.emit()
+        try:
+            super().closeEvent(event)
+        except TypeError:
+            if hasattr(event, "accept"):
+                event.accept()
 
     def _init_ui(self) -> None:
         central = QWidget(self)

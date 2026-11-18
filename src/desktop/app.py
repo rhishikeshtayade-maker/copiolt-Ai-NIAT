@@ -508,33 +508,50 @@ class MainWindow(QMainWindow):
         self.window_combo.clear()
         windows = list_capturable_windows(exclude_titles=("NIAT CodePilot",))
 
+        seen_hwnds = set()
+        practice_hwnd = None
+
         # Check if local practice editor window is open
         if self.practice_editor and self.practice_editor.isVisible():
-            hwnd = int(self.practice_editor.winId())
-            self.window_combo.addItem("🎯 NIAT Local Practice Editor (Authorized Test Bed)", hwnd)
+            try:
+                practice_hwnd = int(self.practice_editor.winId())
+                self.window_combo.addItem("🎯 NIAT Local Practice Editor (Authorized Test Bed)", practice_hwnd)
+                seen_hwnds.add(practice_hwnd)
+            except Exception as e:
+                logger.debug(f"Could not retrieve PracticeEditor winId: {e}")
 
         chrome_index = -1
-        if not windows and (not self.practice_editor or not self.practice_editor.isVisible()):
+        for w in windows:
+            hwnd = w["hwnd"]
+            if hwnd in seen_hwnds:
+                continue
+            seen_hwnds.add(hwnd)
+
+            title = w["title"]
+            rect = w["rect"]
+            width = max(0, rect[2] - rect[0])
+            height = max(0, rect[3] - rect[1])
+
+            is_chrome_or_niat = w.get("is_browser", False) or any(
+                k in title.lower() for k in ("chrome", "niat", "leetcode", "problem")
+            )
+            prefix = "🌐 " if is_chrome_or_niat else "🪟 "
+            display = f"{prefix}{title[:42]} ({width}x{height})"
+            self.window_combo.addItem(display, hwnd)
+
+            if is_chrome_or_niat and chrome_index == -1:
+                chrome_index = self.window_combo.count() - 1
+
+        if self.window_combo.count() == 0:
             self.window_combo.addItem("No capturable windows found", None)
             self.target_desc_label.setText("No active application window detected.")
         else:
-            for idx, w in enumerate(windows):
-                title = w["title"]
-                hwnd = w["hwnd"]
-                rect = w["rect"]
-                width = max(0, rect[2] - rect[0])
-                height = max(0, rect[3] - rect[1])
-
-                is_chrome_or_niat = w.get("is_browser", False) or any(k in title.lower() for k in ("chrome", "niat", "leetcode", "problem"))
-                prefix = "🌐 " if is_chrome_or_niat else "🪟 "
-                display = f"{prefix}{title[:42]} ({width}x{height})"
-                self.window_combo.addItem(display, hwnd)
-
-                if is_chrome_or_niat and chrome_index == -1:
-                    chrome_index = self.window_combo.count() - 1
-
-        if chrome_index >= 0:
-            self.window_combo.setCurrentIndex(chrome_index)
+            if practice_hwnd:
+                idx = self.window_combo.findData(practice_hwnd)
+                if idx >= 0:
+                    self.window_combo.setCurrentIndex(idx)
+            elif chrome_index >= 0:
+                self.window_combo.setCurrentIndex(chrome_index)
 
         self.window_combo.blockSignals(False)
         self._apply_capture_targeting()
@@ -700,23 +717,60 @@ class MainWindow(QMainWindow):
             self.body_splitter.setSizes([1200, 0])
 
     def on_open_practice_editor(self) -> None:
-        """Open or focus the local practice editor test bed."""
-        if self.practice_editor is None:
-            self.practice_editor = PracticeEditorWindow()
-        self.practice_editor.show()
-        self.practice_editor.raise_()
-        self.practice_editor.activateWindow()
+        """Open, restore, or focus the local practice editor test bed."""
+        logger.info("MainWindow: '🎯 Practice Bed' action triggered.")
+        try:
+            # Check if existing instance is still valid (not destroyed by Qt)
+            if self.practice_editor is not None:
+                try:
+                    _ = self.practice_editor.isVisible()
+                except RuntimeError:
+                    logger.info("Previous PracticeEditorWindow C++ instance was destroyed; creating fresh instance.")
+                    self.practice_editor = None
 
-        # Refresh windows so Practice Bed is listed at the top
-        self.refresh_window_list()
-        self.timeline_widget.add_event(
-            TimelineEvent(
-                event_type=TimelineEventType.OBSERVE,
-                title="Practice Editor Launched",
-                description="Local test bed ready for focus detection, typing, and emergency stop testing",
-                status=TimelineEventStatus.SUCCESS,
+            if self.practice_editor is None:
+                logger.info("Instantiating new PracticeEditorWindow...")
+                self.practice_editor = PracticeEditorWindow()
+                self.practice_editor.closed_signal.connect(self._on_practice_editor_closed)
+
+            # Ensure restored if minimized, then show, raise, and activate
+            if self.practice_editor.isMinimized():
+                logger.info("PracticeEditorWindow is minimized; restoring via showNormal().")
+                self.practice_editor.showNormal()
+            else:
+                self.practice_editor.show()
+
+            self.practice_editor.setVisible(True)
+            self.practice_editor.raise_()
+            self.practice_editor.activateWindow()
+
+            hwnd = int(self.practice_editor.winId()) if hasattr(self.practice_editor, "winId") else 0
+            logger.info(
+                f"PracticeEditorWindow displayed successfully (HWND={hwnd}, visible={self.practice_editor.isVisible()})."
             )
-        )
+
+            # Refresh windows so Practice Bed is listed and selected in dropdown
+            self.refresh_window_list()
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.OBSERVE,
+                    title="Practice Editor Launched",
+                    description="Local test bed ready for focus detection, typing, and emergency stop testing",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
+        except Exception as e:
+            logger.exception(f"Error opening or displaying Practice Editor: {e}")
+            QMessageBox.warning(
+                self,
+                "Practice Editor Error",
+                f"Could not open Practice Editor window:\n\n{e}",
+            )
+
+    def _on_practice_editor_closed(self) -> None:
+        """Handle local practice editor window close: refresh window capture target list."""
+        logger.info("PracticeEditorWindow closed. Refreshing window capture dropdown.")
+        self.refresh_window_list()
 
     def on_continuous_observe_toggled(self, observing: bool) -> None:
         """Toggle continuous screen observation."""

@@ -12,6 +12,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.common.logger import get_logger
+
+logger = get_logger("Desktop.FloatingControls")
+
 
 class FloatingControlsDock(QFrame):
     """Compact, floating glass control dock providing instant access to CodePilot actions:
@@ -106,7 +110,7 @@ class FloatingControlsDock(QFrame):
         self.practice_btn = QPushButton("🎯  Practice Bed", self)
         self.practice_btn.setFixedHeight(42)
         self.practice_btn.setToolTip("Open local practice editor to verify typing, focus loss & emergency stop")
-        self.practice_btn.clicked.connect(self.open_practice_editor_clicked.emit)
+        self.practice_btn.clicked.connect(self._on_practice_bed_clicked)
         action_row.addWidget(self.practice_btn, 1)
 
         # 4. Continuous Observation toggle
@@ -298,6 +302,10 @@ class FloatingControlsDock(QFrame):
         self._is_observing = self.observe_btn.isChecked()
         self.observe_btn.setText("👁️  Observe: On" if self._is_observing else "👁️  Observe: Off")
         self.continuous_observe_toggled.emit(self._is_observing)
+
+    def _on_practice_bed_clicked(self) -> None:
+        logger.info("FloatingControls: '🎯 Practice Bed' clicked. Emitting open_practice_editor_clicked.")
+        self.open_practice_editor_clicked.emit()
 
     def _on_toggle_workspace(self) -> None:
         self._workspace_expanded = not self._workspace_expanded

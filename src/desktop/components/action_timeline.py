@@ -1,7 +1,7 @@
 """Action Timeline widget displaying computer-use agent execution steps in real time."""
 
 from typing import Optional
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QFrame,
