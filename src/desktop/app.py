@@ -1,17 +1,25 @@
-"""Main PySide6 application window for the NIAT CodePilot Worker."""
+"""Main PySide6 application window for the NIAT CodePilot Worker.
+
+Implements the Approved Premium UI & Computer-Use Agent:
+- Balanced futuristic glass-and-midnight design.
+- Central animated AI Assistant Orb (Idle, Listening, Thinking, Analyzing, Responding, Error).
+- Floating assistant controls dock (Voice mic, text query, 1-click analyze, keyboard typing, practice bed, workspace toggle, pause, emergency stop).
+- Live Action Timeline documenting observation, focus checks, keystroke chunks, and verifications.
+- Expandable structured coding workspace (Overview, Approach, Code Review, Debugging & Edge Cases).
+- Robust NIAT Portal Chrome window discovery, explicit consent, approved-frame synchronization, and emergency halt.
+- Zero clipboard paste: keyboard input via Windows SendInput with intra-chunk focus verification and emergency stop abort.
+"""
 
 import asyncio
 import base64
-import io
 import time
-from typing import Optional
+from typing import Optional, Tuple
 from PySide6.QtCore import QByteArray, QDateTime, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QFont, QImage, QPixmap
+from PySide6.QtGui import QColor, QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -22,7 +30,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
-    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -32,11 +39,24 @@ from src.common.config import settings
 from src.common.constants import WorkerCommand, WorkerStatus
 from src.common.logger import get_logger
 from src.common.schemas import CodingAnalysisResult
+from src.desktop.components.action_timeline import ActionTimelineWidget
+from src.desktop.components.ai_orb import AIOrbContainer, OrbState
+from src.desktop.components.coding_workspace import CodingWorkspaceWidget
+from src.desktop.components.floating_controls import FloatingControlsDock
+from src.desktop.components.practice_editor import PracticeEditorWindow
 from src.desktop.components.preview_widget import ScreenPreviewWidget
 from src.desktop.components.status_bar import ConnectionStatusBar
 from src.worker.ai_engine import AIEngineService
 from src.worker.capture import ScreenCaptureService, list_capturable_windows
 from src.worker.client import WorkerClient
+from src.worker.interaction import (
+    EditorFocusLostError,
+    EmergencyStopError,
+    KeyboardComputerUseAgent,
+    TimelineEvent,
+    TimelineEventStatus,
+    TimelineEventType,
+)
 
 logger = get_logger("Desktop.App")
 
@@ -127,444 +147,486 @@ class AIAnalysisThread(QThread):
             loop.close()
 
 
+class InteractiveTypingWorkerThread(QThread):
+    """Background thread executing KeyboardComputerUseAgent without blocking the Qt GUI."""
+
+    timeline_event_signal = Signal(object)  # TimelineEvent
+    typing_complete = Signal(bool)
+    typing_error = Signal(str)
+
+    def __init__(
+        self,
+        target_hwnd: int,
+        target_title: str,
+        code_to_type: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.target_hwnd = target_hwnd
+        self.target_title = target_title
+        self.code_to_type = code_to_type
+        self.is_paused = False
+        self.is_stopped = False
+
+    def run(self) -> None:
+        agent = KeyboardComputerUseAgent(
+            target_hwnd=self.target_hwnd,
+            target_title=self.target_title,
+            chunk_size=14,
+            delay_between_chunks=0.035,
+            on_timeline_event=lambda ev: self.timeline_event_signal.emit(ev),
+            is_paused_check=lambda: self.is_paused,
+            is_stopped_check=lambda: self.is_stopped,
+        )
+        try:
+            ok = agent.type_code(self.code_to_type)
+            self.typing_complete.emit(ok)
+        except Exception as e:
+            logger.error(f"Interactive typing error: {e}")
+            self.typing_error.emit(str(e))
+
+    def stop(self) -> None:
+        self.is_stopped = True
+
+    def toggle_pause(self) -> None:
+        self.is_paused = not self.is_paused
+
+
 class MainWindow(QMainWindow):
-    """Central graphical window for the NIAT CodePilot Worker laptop."""
+    """Approved Premium UI for NIAT CodePilot Worker with Computer-Use Agent."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("NIAT CodePilot - Distributed Worker & Screen Capture")
-        self.resize(1200, 800)
+        self.setWindowTitle("NIAT CodePilot — Autonomous AI Coding Assistant")
+        self.resize(1320, 860)
+        self.setMinimumSize(1020, 720)
 
-        # Worker services
+        # Worker core services
         self.capture_service = ScreenCaptureService(worker_id=settings.worker_id)
         self.worker_client = WorkerClient(
             worker_id=settings.worker_id,
             worker_name=settings.worker_name,
             controller_url=settings.controller_url,
+            secret_key=settings.controller_secret_key,
             on_command_received=self.handle_controller_command,
         )
         self.ai_engine = AIEngineService()
 
         self.heartbeat_thread: Optional[HeartbeatWorkerThread] = None
         self.ai_thread: Optional[AIAnalysisThread] = None
+        self.typing_thread: Optional[InteractiveTypingWorkerThread] = None
+        self.practice_editor: Optional[PracticeEditorWindow] = None
 
-        # Preview refresh timer
+        # Preview & Continuous Observation timers
         self.preview_timer = QTimer(self)
-        self.preview_timer.setInterval(2000)  # Capture preview every 2s when active
+        self.preview_timer.setInterval(2000)
         self.preview_timer.timeout.connect(self.on_auto_preview_tick)
 
+        self.observe_timer = QTimer(self)
+        self.observe_timer.setInterval(2500)
+        self.observe_timer.timeout.connect(self.on_continuous_observe_tick)
+
         self._init_ui()
-        self._apply_dark_styles()
+        self._apply_global_theme()
+        self._auto_start_worker()
 
     def _init_ui(self) -> None:
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(15, 15, 15, 10)
+        root_layout = QVBoxLayout(central_widget)
+        root_layout.setContentsMargins(16, 12, 16, 10)
+        root_layout.setSpacing(10)
 
-        # 1. Config & Connection Header
-        config_group = QGroupBox("Worker & Controller Configuration")
-        config_layout = QHBoxLayout(config_group)
+        # -------------------------------------------------------------
+        # 1. Top Glass Header Bar
+        # -------------------------------------------------------------
+        top_bar = QFrame(self)
+        top_bar.setObjectName("TopBar")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(16, 8, 16, 8)
+        top_layout.setSpacing(14)
 
-        self.worker_id_edit = QLineEdit(settings.worker_id)
-        self.worker_name_edit = QLineEdit(settings.worker_name)
-        self.controller_url_edit = QLineEdit(settings.controller_url)
-        self.secret_key_edit = QLineEdit(settings.controller_secret_key)
-        self.secret_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        # Left: App Brand & Worker Pill
+        brand_col = QVBoxLayout()
+        brand_col.setSpacing(2)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        brand_dot = QLabel("●", self)
+        brand_dot.setStyleSheet("color: #00E5FF; font-size: 14px;")
+        title_row.addWidget(brand_dot)
 
-        form1 = QFormLayout()
-        form1.addRow("Worker ID:", self.worker_id_edit)
-        config_layout.addLayout(form1)
+        brand_title = QLabel("NIAT CodePilot", self)
+        brand_title.setStyleSheet("color: #FFFFFF; font-size: 16px; font-weight: bold; letter-spacing: 0.5px;")
+        title_row.addWidget(brand_title)
+        brand_col.addLayout(title_row)
 
-        form2 = QFormLayout()
-        form2.addRow("Worker Name:", self.worker_name_edit)
-        config_layout.addLayout(form2)
+        self.worker_pill = QLabel(f"Laptop 2 • {settings.worker_id} ({settings.worker_name})", self)
+        self.worker_pill.setStyleSheet("color: #8E9DB8; font-size: 11px;")
+        brand_col.addWidget(self.worker_pill)
+        top_layout.addLayout(brand_col)
 
-        form3 = QFormLayout()
-        form3.addRow("Controller URL:", self.controller_url_edit)
-        config_layout.addLayout(form3)
+        top_layout.addSpacing(10)
 
-        form4 = QFormLayout()
-        form4.addRow("Secret Key:", self.secret_key_edit)
-        config_layout.addLayout(form4)
+        # Center: Target Selector Pill & NIAT Chrome Selector
+        target_box = QFrame(self)
+        target_box.setObjectName("TargetBox")
+        t_layout = QHBoxLayout(target_box)
+        t_layout.setContentsMargins(10, 4, 10, 4)
+        t_layout.setSpacing(8)
 
-        main_layout.addWidget(config_group)
+        t_lbl = QLabel("Target:", self)
+        t_lbl.setStyleSheet("color: #A0AEC0; font-size: 11px; font-weight: bold;")
+        t_layout.addWidget(t_lbl)
 
-        # 2. Explicit Permission & Policy Verification Box
-        permission_group = QGroupBox("Privacy, Safety & User Permission (Strict Policy)")
-        perm_layout = QVBoxLayout(permission_group)
-
-        self.consent_checkbox = QCheckBox(
-            "I EXPLICITLY GRANT PERMISSION for NIAT CodePilot to capture my screen for coding guidance and analysis."
-        )
-        self.consent_checkbox.setStyleSheet(
-            "font-weight: bold; font-size: 13px; color: #4CAF50;"
-        )
-        self.consent_checkbox.toggled.connect(self.on_consent_toggled)
-        perm_layout.addWidget(self.consent_checkbox)
-
-        policy_text = QLabel(
-            "Security Policy: No student passwords stored | No automatic portal submissions "
-            "| Student approval required for all actions | Screen capture is never silent."
-        )
-        policy_text.setStyleSheet("color: #aaaaaa; font-size: 11px;")
-        perm_layout.addWidget(policy_text)
-
-        main_layout.addWidget(permission_group)
-
-        # 3. Main Center Splitter (Left: Controls & Logs, Right: Preview + AI)
-        content_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        # Left Column: Buttons & Logs
-        left_widget = QWidget()
-        left_column = QVBoxLayout(left_widget)
-        left_column.setContentsMargins(0, 0, 0, 0)
-
-        # Screen Capture Target Selection (Window / Region / Full Screen)
-        target_group = QGroupBox("Screen Capture Target (Window / Region Selection)")
-        target_layout = QVBoxLayout(target_group)
-
-        # Target Mode combo
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("Target:"))
-        self.target_mode_combo = QComboBox()
-        self.target_mode_combo.addItem("Full Screen (Primary Monitor)", "monitor")
+        self.target_mode_combo = QComboBox(self)
         self.target_mode_combo.addItem("Application Window", "window")
-        self.target_mode_combo.addItem("Rectangular Region", "region")
+        self.target_mode_combo.addItem("Full Screen (Primary Monitor)", "monitor")
+        self.target_mode_combo.addItem("Custom Region", "region")
         self.target_mode_combo.currentIndexChanged.connect(self.on_target_mode_changed)
-        mode_layout.addWidget(self.target_mode_combo, 1)
-        target_layout.addLayout(mode_layout)
+        t_layout.addWidget(self.target_mode_combo)
 
-        # Window selection row
-        self.window_selection_widget = QWidget()
-        win_layout = QHBoxLayout(self.window_selection_widget)
-        win_layout.setContentsMargins(0, 0, 0, 0)
-        win_layout.addWidget(QLabel("Window:"))
-        self.window_combo = QComboBox()
+        self.window_combo = QComboBox(self)
+        self.window_combo.setMinimumWidth(280)
         self.window_combo.currentIndexChanged.connect(self.on_window_selected)
-        win_layout.addWidget(self.window_combo, 1)
-        self.refresh_windows_btn = QPushButton("🔄 Refresh")
-        self.refresh_windows_btn.setFixedWidth(80)
-        self.refresh_windows_btn.clicked.connect(self.refresh_window_list)
-        win_layout.addWidget(self.refresh_windows_btn)
-        self.window_selection_widget.setVisible(False)
-        target_layout.addWidget(self.window_selection_widget)
+        t_layout.addWidget(self.window_combo)
 
-        # Region selection row
-        self.region_selection_widget = QWidget()
-        reg_layout = QHBoxLayout(self.region_selection_widget)
-        reg_layout.setContentsMargins(0, 0, 0, 0)
-        reg_layout.addWidget(QLabel("X:"))
-        self.region_x_spin = QSpinBox()
-        self.region_x_spin.setRange(0, 10000)
-        self.region_x_spin.setValue(0)
-        self.region_x_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
-        reg_layout.addWidget(self.region_x_spin)
+        self.refresh_btn = QPushButton("🔄", self)
+        self.refresh_btn.setFixedSize(28, 28)
+        self.refresh_btn.setToolTip("Scan & Refresh open windows (Google Chrome NIAT portal, Practice Bed)")
+        self.refresh_btn.clicked.connect(self.refresh_window_list)
+        t_layout.addWidget(self.refresh_btn)
 
-        reg_layout.addWidget(QLabel("Y:"))
-        self.region_y_spin = QSpinBox()
-        self.region_y_spin.setRange(0, 10000)
-        self.region_y_spin.setValue(0)
-        self.region_y_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
-        reg_layout.addWidget(self.region_y_spin)
+        # Region coordinates widgets (hidden by default)
+        self.region_container = QWidget(self)
+        reg_l = QHBoxLayout(self.region_container)
+        reg_l.setContentsMargins(0, 0, 0, 0)
+        reg_l.setSpacing(4)
+        self.reg_x = QSpinBox(self); self.reg_x.setRange(0, 10000); self.reg_x.setValue(0)
+        self.reg_y = QSpinBox(self); self.reg_y.setRange(0, 10000); self.reg_y.setValue(0)
+        self.reg_w = QSpinBox(self); self.reg_w.setRange(50, 10000); self.reg_w.setValue(1280)
+        self.reg_h = QSpinBox(self); self.reg_h.setRange(50, 10000); self.reg_h.setValue(720)
+        for s in (self.reg_x, self.reg_y, self.reg_w, self.reg_h):
+            s.valueChanged.connect(self._apply_capture_targeting)
+            reg_l.addWidget(s)
+        self.region_container.setVisible(False)
+        t_layout.addWidget(self.region_container)
 
-        reg_layout.addWidget(QLabel("W:"))
-        self.region_w_spin = QSpinBox()
-        self.region_w_spin.setRange(10, 10000)
-        self.region_w_spin.setValue(1280)
-        self.region_w_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
-        reg_layout.addWidget(self.region_w_spin)
+        top_layout.addWidget(target_box, 1)
 
-        reg_layout.addWidget(QLabel("H:"))
-        self.region_h_spin = QSpinBox()
-        self.region_h_spin.setRange(10, 10000)
-        self.region_h_spin.setValue(720)
-        self.region_h_spin.valueChanged.connect(lambda: self._apply_capture_targeting())
-        reg_layout.addWidget(self.region_h_spin)
-        self.region_selection_widget.setVisible(False)
-        target_layout.addWidget(self.region_selection_widget)
+        # Right: Explicit Consent Switch & AI Model Badge
+        self.consent_checkbox = QCheckBox("Consent Active ✓", self)
+        self.consent_checkbox.setChecked(True)
+        self.consent_checkbox.setToolTip("Explicit Student Permission: Enables screen capture for coding analysis")
+        self.consent_checkbox.toggled.connect(self.on_consent_toggled)
+        top_layout.addWidget(self.consent_checkbox)
 
-        # Approved frame status label
-        self.approved_frame_label = QLabel("Approved Frame: None (Click 'Capture Single Preview' to prepare)")
-        self.approved_frame_label.setStyleSheet("color: #ffb74d; font-size: 11px;")
-        target_layout.addWidget(self.approved_frame_label)
+        self.ai_provider_pill = QLabel(f"Gemini • {settings.gemini_model}", self)
+        self.ai_provider_pill.setObjectName("ProviderPill")
+        top_layout.addWidget(self.ai_provider_pill)
 
-        left_column.addWidget(target_group)
+        root_layout.addWidget(top_bar)
 
-        controls_group = QGroupBox("Execution Controls")
-        btn_layout = QVBoxLayout(controls_group)
+        # -------------------------------------------------------------
+        # 2. Main Center Body (Splitter for Stage vs Expandable Workspace)
+        # -------------------------------------------------------------
+        self.body_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.body_splitter.setHandleWidth(8)
 
-        self.start_btn = QPushButton("▶  Start Worker & Capture")
-        self.start_btn.setEnabled(False)  # Requires consent
-        self.start_btn.setFixedHeight(42)
-        self.start_btn.setStyleSheet(
-            "background-color: #2e7d32; color: white; font-weight: bold; font-size: 13px; border-radius: 4px;"
-        )
-        self.start_btn.clicked.connect(self.on_start_clicked)
-        btn_layout.addWidget(self.start_btn)
+        # Left Stage: Center AI Orb + Floating Controls + Timeline + Preview Card
+        self.stage_widget = QWidget(self)
+        stage_layout = QVBoxLayout(self.stage_widget)
+        stage_layout.setContentsMargins(0, 0, 0, 0)
+        stage_layout.setSpacing(10)
+        stage_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.stop_btn = QPushButton("⏹  Stop Worker")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setFixedHeight(42)
-        self.stop_btn.setStyleSheet(
-            "background-color: #555555; color: white; font-weight: bold; font-size: 13px; border-radius: 4px;"
-        )
-        self.stop_btn.clicked.connect(self.on_stop_clicked)
-        btn_layout.addWidget(self.stop_btn)
+        # Floating AI Orb
+        self.orb_container = AIOrbContainer(self)
+        stage_layout.addWidget(self.orb_container, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.preview_btn = QPushButton("📷  Capture Single Preview")
-        self.preview_btn.setEnabled(False)
-        self.preview_btn.setFixedHeight(36)
-        self.preview_btn.setStyleSheet(
-            "background-color: #1976d2; color: white; font-weight: bold; border-radius: 4px;"
-        )
-        self.preview_btn.clicked.connect(self.on_single_preview_clicked)
-        btn_layout.addWidget(self.preview_btn)
+        # Floating Controls Dock
+        self.controls_dock = FloatingControlsDock(self)
+        self.controls_dock.voice_toggled.connect(self.on_voice_toggled)
+        self.controls_dock.text_prompt_submitted.connect(self.on_text_submitted)
+        self.controls_dock.analyze_clicked.connect(self.on_analyze_screen_clicked)
+        self.controls_dock.type_code_clicked.connect(self.on_type_code_clicked)
+        self.controls_dock.open_practice_editor_clicked.connect(self.on_open_practice_editor)
+        self.controls_dock.continuous_observe_toggled.connect(self.on_continuous_observe_toggled)
+        self.controls_dock.toggle_workspace_clicked.connect(self.on_toggle_workspace)
+        self.controls_dock.pause_resume_clicked.connect(self.on_pause_resume_clicked)
+        self.controls_dock.emergency_stop_clicked.connect(self.on_emergency_stop_clicked)
+        stage_layout.addWidget(self.controls_dock)
 
-        # Analyze Screen button
-        self.analyze_btn = QPushButton("🧠  Analyze Screen with AI")
-        self.analyze_btn.setEnabled(False)
-        self.analyze_btn.setFixedHeight(42)
-        self.analyze_btn.setStyleSheet(
-            "background-color: #7b1fa2; color: white; font-weight: bold; font-size: 13px; border-radius: 4px;"
-        )
-        self.analyze_btn.clicked.connect(self.on_analyze_screen_clicked)
-        btn_layout.addWidget(self.analyze_btn)
+        # Action Timeline
+        self.timeline_widget = ActionTimelineWidget(self)
+        stage_layout.addWidget(self.timeline_widget)
 
-        self.emergency_btn = QPushButton("🚨  EMERGENCY STOP")
-        self.emergency_btn.setFixedHeight(48)
-        self.emergency_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #d32f2f;
-                color: white;
-                font-weight: bold;
-                font-size: 14px;
-                border-radius: 4px;
-                border: 2px solid #ff5252;
-            }
-            QPushButton:hover {
-                background-color: #b71c1c;
-            }
-            """
-        )
-        self.emergency_btn.clicked.connect(self.on_emergency_stop_clicked)
-        btn_layout.addWidget(self.emergency_btn)
+        # Target Preview & Approved Frame Card
+        preview_card = QFrame(self)
+        preview_card.setObjectName("PreviewCard")
+        p_card_layout = QHBoxLayout(preview_card)
+        p_card_layout.setContentsMargins(12, 6, 12, 6)
+        p_card_layout.setSpacing(12)
 
-        left_column.addWidget(controls_group)
-
-        # Additional prompt input
-        prompt_group = QGroupBox("Additional Question (Optional)")
-        prompt_layout = QVBoxLayout(prompt_group)
-        self.additional_prompt_edit = QLineEdit()
-        self.additional_prompt_edit.setPlaceholderText(
-            "e.g. 'Explain the time complexity' or 'Show a recursive approach'"
-        )
-        prompt_layout.addWidget(self.additional_prompt_edit)
-        left_column.addWidget(prompt_group)
-
-        # Log box
-        log_group = QGroupBox("Activity & Security Log")
-        log_layout = QVBoxLayout(log_group)
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet(
-            "background-color: #121212; color: #cccccc; font-family: Consolas, monospace; font-size: 11px;"
-        )
-        log_layout.addWidget(self.log_text)
-        left_column.addWidget(log_group)
-
-        content_splitter.addWidget(left_widget)
-
-        # Right Column: Tabbed Preview + AI Results
-        right_widget = QWidget()
-        right_column = QVBoxLayout(right_widget)
-        right_column.setContentsMargins(0, 0, 0, 0)
-
-        self.right_tabs = QTabWidget()
-        self.right_tabs.setStyleSheet(
-            """
-            QTabWidget::pane { border: 1px solid #3c3c3c; background: #1e1e1e; }
-            QTabBar::tab { background: #2d2d2d; color: #cccccc; padding: 6px 14px; border: 1px solid #3c3c3c; border-bottom: none; }
-            QTabBar::tab:selected { background: #1e1e1e; color: #ffffff; }
-            QTabBar::tab:hover { background: #3c3c3c; }
-            """
-        )
-
-        # Tab 1: Screen Preview
-        preview_tab = QWidget()
-        preview_layout = QVBoxLayout(preview_tab)
         self.preview_widget = ScreenPreviewWidget(self)
-        preview_layout.addWidget(self.preview_widget)
-        self.preview_info_label = QLabel("Frame status: Inactive")
-        self.preview_info_label.setStyleSheet("color: #888888; font-size: 11px;")
-        preview_layout.addWidget(self.preview_info_label)
-        self.right_tabs.addTab(preview_tab, "📺 Screen Preview")
+        self.preview_widget.setFixedSize(140, 80)
+        p_card_layout.addWidget(self.preview_widget)
 
-        # Tab 2: AI Analysis Results
-        ai_tab = QWidget()
-        ai_layout = QVBoxLayout(ai_tab)
+        p_info_col = QVBoxLayout()
+        p_info_col.setSpacing(2)
+        self.approved_frame_label = QLabel("Approved Frame: None (Click 'Snapshot' or 'Analyze Question')", self)
+        self.approved_frame_label.setStyleSheet("color: #FFB74D; font-size: 11px; font-weight: bold;")
+        p_info_col.addWidget(self.approved_frame_label)
 
-        # Loading indicator
-        self.ai_progress = QProgressBar()
-        self.ai_progress.setRange(0, 0)  # Indeterminate
-        self.ai_progress.setVisible(False)
-        self.ai_progress.setFixedHeight(6)
-        self.ai_progress.setStyleSheet(
-            "QProgressBar { border: none; background: #2d2d2d; }"
-            "QProgressBar::chunk { background: #7b1fa2; }"
-        )
-        ai_layout.addWidget(self.ai_progress)
+        self.target_desc_label = QLabel("Active Target: Auto-detecting Chrome NIAT Portal...", self)
+        self.target_desc_label.setStyleSheet("color: #8E9DB8; font-size: 11px;")
+        p_info_col.addWidget(self.target_desc_label)
 
-        self.ai_loading_label = QLabel("")
-        self.ai_loading_label.setStyleSheet("color: #bb86fc; font-weight: bold; font-size: 12px;")
-        self.ai_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ai_layout.addWidget(self.ai_loading_label)
+        p_btn_row = QHBoxLayout()
+        self.snapshot_btn = QPushButton("📷  Take Snapshot", self)
+        self.snapshot_btn.setFixedHeight(26)
+        self.snapshot_btn.clicked.connect(self.on_single_preview_clicked)
+        p_btn_row.addWidget(self.snapshot_btn)
+        p_btn_row.addStretch()
+        p_info_col.addLayout(p_btn_row)
 
-        # Scrollable results area
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: none; background: #1e1e1e; }")
-        scroll_content = QWidget()
-        self.ai_results_layout = QVBoxLayout(scroll_content)
-        self.ai_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        p_card_layout.addLayout(p_info_col, 1)
+        stage_layout.addWidget(preview_card)
 
-        # Problem Description
-        self.problem_title_label = QLabel("")
-        self.problem_title_label.setStyleSheet(
-            "color: #ffffff; font-size: 16px; font-weight: bold; padding: 4px 0;"
-        )
-        self.problem_title_label.setWordWrap(True)
-        self.ai_results_layout.addWidget(self.problem_title_label)
+        self.body_splitter.addWidget(self.stage_widget)
 
-        self.problem_desc_text = QTextEdit()
-        self.problem_desc_text.setReadOnly(True)
-        self.problem_desc_text.setMaximumHeight(120)
-        self.problem_desc_text.setStyleSheet(
-            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; "
-            "border-radius: 4px; font-size: 12px; padding: 6px;"
-        )
-        self.ai_results_layout.addWidget(self.problem_desc_text)
+        # Right Stage: Expandable Structured Coding Workspace
+        self.workspace_widget = CodingWorkspaceWidget(self)
+        self.workspace_widget.close_requested.connect(self.on_toggle_workspace)
+        self.workspace_widget.setVisible(False)  # Collapsed by default
+        self.body_splitter.addWidget(self.workspace_widget)
 
-        # Explanation
-        expl_label = QLabel("Step-by-Step Explanation")
-        expl_label.setStyleSheet("color: #4FC3F7; font-weight: bold; font-size: 13px; margin-top: 8px;")
-        self.ai_results_layout.addWidget(expl_label)
+        root_layout.addWidget(self.body_splitter, 1)
 
-        self.explanation_text = QTextEdit()
-        self.explanation_text.setReadOnly(True)
-        self.explanation_text.setMinimumHeight(120)
-        self.explanation_text.setStyleSheet(
-            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; "
-            "border-radius: 4px; font-size: 12px; padding: 6px;"
-        )
-        self.ai_results_layout.addWidget(self.explanation_text)
-
-        # Suggested Code
-        code_label = QLabel("Suggested Code (Requires Student Review)")
-        code_label.setStyleSheet("color: #81C784; font-weight: bold; font-size: 13px; margin-top: 8px;")
-        self.ai_results_layout.addWidget(code_label)
-
-        self.code_text = QTextEdit()
-        self.code_text.setReadOnly(True)
-        self.code_text.setMinimumHeight(140)
-        self.code_text.setStyleSheet(
-            "background-color: #1a1a2e; color: #a5d6a7; border: 1px solid #3c3c3c; "
-            "border-radius: 4px; font-family: Consolas, 'Courier New', monospace; font-size: 12px; padding: 6px;"
-        )
-        self.ai_results_layout.addWidget(self.code_text)
-
-        # Edge Cases & Concepts
-        extra_label = QLabel("Concepts & Edge Cases")
-        extra_label.setStyleSheet("color: #FFB74D; font-weight: bold; font-size: 13px; margin-top: 8px;")
-        self.ai_results_layout.addWidget(extra_label)
-
-        self.extra_info_text = QTextEdit()
-        self.extra_info_text.setReadOnly(True)
-        self.extra_info_text.setMinimumHeight(100)
-        self.extra_info_text.setStyleSheet(
-            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; "
-            "border-radius: 4px; font-size: 12px; padding: 6px;"
-        )
-        self.ai_results_layout.addWidget(self.extra_info_text)
-
-        # Error display
-        self.ai_error_label = QLabel("")
-        self.ai_error_label.setStyleSheet(
-            "color: #ff5252; font-weight: bold; font-size: 12px; padding: 6px;"
-        )
-        self.ai_error_label.setWordWrap(True)
-        self.ai_error_label.setVisible(False)
-        self.ai_results_layout.addWidget(self.ai_error_label)
-
-        # Student approval reminder
-        self.approval_label = QLabel(
-            "⚠ All suggestions require YOUR explicit review and approval before use. "
-            "No automatic submissions will be made."
-        )
-        self.approval_label.setStyleSheet(
-            "color: #FFD54F; font-size: 11px; font-weight: bold; padding: 6px; margin-top: 8px;"
-        )
-        self.approval_label.setWordWrap(True)
-        self.ai_results_layout.addWidget(self.approval_label)
-
-        scroll.setWidget(scroll_content)
-        ai_layout.addWidget(scroll)
-        self.right_tabs.addTab(ai_tab, "🧠 AI Analysis")
-
-        right_column.addWidget(self.right_tabs)
-        content_splitter.addWidget(right_widget)
-
-        content_splitter.setStretchFactor(0, 4)
-        content_splitter.setStretchFactor(1, 6)
-
-        main_layout.addWidget(content_splitter)
-
-        # 4. Status Bar
+        # -------------------------------------------------------------
+        # 3. Bottom Status Bar
+        # -------------------------------------------------------------
         self.status_bar = ConnectionStatusBar(self)
-        main_layout.addWidget(self.status_bar)
+        root_layout.addWidget(self.status_bar)
 
-        self.append_log("NIAT CodePilot Worker initialized. Awaiting explicit user consent.")
-        api_status = "configured" if self.ai_engine.is_configured else "NOT configured (mock mode)"
-        self.append_log(f"AI Engine: OpenAI API {api_status} | Model: {self.ai_engine.model}")
+        # Populate initial window list
+        self.refresh_window_list()
 
-    def _apply_dark_styles(self) -> None:
+    def _apply_global_theme(self) -> None:
+        """Apply the approved balanced futuristic midnight theme."""
         self.setStyleSheet(
             """
             QMainWindow {
-                background-color: #1e1e1e;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0B0F19, stop:1 #060810);
             }
-            QGroupBox {
-                border: 1px solid #3c3c3c;
-                border-radius: 6px;
-                margin-top: 12px;
+            #TopBar {
+                background-color: rgba(18, 24, 38, 0.75);
+                border: 1px solid rgba(0, 229, 255, 0.18);
+                border-radius: 14px;
+            }
+            #TargetBox {
+                background-color: rgba(11, 15, 25, 0.65);
+                border: 1px solid rgba(255, 255, 255, 0.10);
+                border-radius: 10px;
+            }
+            #ProviderPill {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(124, 77, 255, 0.25), stop:1 rgba(41, 121, 255, 0.25));
+                color: #B388FF;
+                border: 1px solid rgba(179, 136, 255, 0.40);
+                border-radius: 12px;
+                padding: 4px 14px;
+                font-size: 11px;
                 font-weight: bold;
-                color: #e0e0e0;
-                padding-top: 10px;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
+            #PreviewCard {
+                background-color: rgba(18, 24, 38, 0.60);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 12px;
             }
-            QLineEdit {
-                background-color: #2d2d2d;
-                border: 1px solid #3c3c3c;
+            QComboBox {
+                background-color: rgba(22, 30, 48, 0.85);
+                color: #E2E8F0;
+                border: 1px solid rgba(0, 229, 255, 0.25);
+                border-radius: 8px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-family: 'Segoe UI', sans-serif;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #0E1422;
+                color: #E2E8F0;
+                selection-background-color: #2979FF;
+                border: 1px solid rgba(0, 229, 255, 0.30);
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QCheckBox {
+                color: #00E676;
+                font-weight: bold;
+                font-size: 12px;
+                spacing: 6px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
                 border-radius: 4px;
-                color: #ffffff;
-                padding: 4px 8px;
+                border: 1px solid rgba(0, 230, 118, 0.50);
+                background-color: rgba(0, 230, 118, 0.15);
             }
-            QLabel {
-                color: #e0e0e0;
+            QCheckBox::indicator:checked {
+                background-color: #00E676;
+            }
+            QSpinBox {
+                background-color: rgba(22, 30, 48, 0.85);
+                color: #FFFFFF;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 6px;
+                padding: 2px 6px;
+                font-size: 11px;
+            }
+            QSplitter::handle {
+                background-color: rgba(0, 229, 255, 0.08);
+                border-radius: 4px;
+            }
+            QSplitter::handle:hover {
+                background-color: rgba(0, 229, 255, 0.30);
             }
             """
         )
 
-    def append_log(self, text: str) -> None:
-        timestamp = QDateTime.currentDateTime().toString("hh:mm:ss")
-        self.log_text.append(f"[{timestamp}] {text}")
+    # -------------------------------------------------------------
+    # Target Selection & Chrome Window Discovery
+    # -------------------------------------------------------------
+    def refresh_window_list(self) -> None:
+        """Scan open desktop windows and populate dropdown, prioritizing Chrome and Practice Bed."""
+        self.window_combo.blockSignals(True)
+        self.window_combo.clear()
+        windows = list_capturable_windows(exclude_titles=("NIAT CodePilot",))
 
+        # Check if local practice editor window is open
+        if self.practice_editor and self.practice_editor.isVisible():
+            hwnd = int(self.practice_editor.winId())
+            self.window_combo.addItem("🎯 NIAT Local Practice Editor (Authorized Test Bed)", hwnd)
+
+        chrome_index = -1
+        if not windows and (not self.practice_editor or not self.practice_editor.isVisible()):
+            self.window_combo.addItem("No capturable windows found", None)
+            self.target_desc_label.setText("No active application window detected.")
+        else:
+            for idx, w in enumerate(windows):
+                title = w["title"]
+                hwnd = w["hwnd"]
+                rect = w["rect"]
+                width = max(0, rect[2] - rect[0])
+                height = max(0, rect[3] - rect[1])
+
+                is_chrome_or_niat = w.get("is_browser", False) or any(k in title.lower() for k in ("chrome", "niat", "leetcode", "problem"))
+                prefix = "🌐 " if is_chrome_or_niat else "🪟 "
+                display = f"{prefix}{title[:42]} ({width}x{height})"
+                self.window_combo.addItem(display, hwnd)
+
+                if is_chrome_or_niat and chrome_index == -1:
+                    chrome_index = self.window_combo.count() - 1
+
+        if chrome_index >= 0:
+            self.window_combo.setCurrentIndex(chrome_index)
+
+        self.window_combo.blockSignals(False)
+        self._apply_capture_targeting()
+
+    def on_target_mode_changed(self, index: int) -> None:
+        mode = self.target_mode_combo.currentData()
+        self.window_combo.setVisible(mode == "window")
+        self.refresh_btn.setVisible(mode == "window")
+        self.region_container.setVisible(mode == "region")
+        if mode == "window":
+            self.refresh_window_list()
+        self._apply_capture_targeting()
+
+    def on_window_selected(self, index: int) -> None:
+        self._apply_capture_targeting()
+
+    def _apply_capture_targeting(self) -> None:
+        """Synchronize UI selections into the ScreenCaptureService."""
+        mode = self.target_mode_combo.currentData() or "window"
+        if mode == "window":
+            hwnd = self.window_combo.currentData()
+            title = self.window_combo.currentText()
+            self.capture_service.set_target_mode("window", window_hwnd=hwnd, window_title=title)
+            self.target_desc_label.setText(f"Target: {title}")
+        elif mode == "region":
+            x, y = self.reg_x.value(), self.reg_y.value()
+            w, h = self.reg_w.value(), self.reg_h.value()
+            self.capture_service.set_target_mode("region", region_rect=(x, y, w, h))
+            self.target_desc_label.setText(f"Target: Region ({x}, {y}, {w}x{h})")
+        else:
+            self.capture_service.set_target_mode("monitor", monitor_index=1)
+            self.target_desc_label.setText("Target: Primary Monitor (Full Screen)")
+
+    # -------------------------------------------------------------
+    # Worker Lifecycle & Registration
+    # -------------------------------------------------------------
+    def _auto_start_worker(self) -> None:
+        """Register worker, activate consent, and start heartbeats."""
+        self.capture_service.set_user_permission(True)
+        self.worker_client.set_permission_active(True)
+        self.status_bar.set_permission_status(True)
+
+        loop = asyncio.new_event_loop()
+        try:
+            resp = loop.run_until_complete(self.worker_client.register(explicit_consent=True))
+            self.status_bar.set_connection_status(True, f"ID: {resp.worker_id}")
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.VERIFY,
+                    title="Worker Registered",
+                    description=f"Connected to controller with ID '{resp.worker_id}'",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Initial controller registration note: {e}")
+            self.status_bar.set_connection_status(False, "Offline / Local Mode")
+        finally:
+            loop.close()
+
+        try:
+            self.capture_service.start()
+        except Exception as e:
+            logger.warning(f"Capture service start note: {e}")
+
+        if self.heartbeat_thread is None or not self.heartbeat_thread.isRunning():
+            self.heartbeat_thread = HeartbeatWorkerThread(self.worker_client, self)
+            self.heartbeat_thread.heartbeat_success.connect(self.on_heartbeat_success)
+            self.heartbeat_thread.heartbeat_error.connect(self.on_heartbeat_error)
+            self.heartbeat_thread.command_received.connect(self.handle_controller_command)
+            self.heartbeat_thread.start()
+
+        self.preview_timer.start()
+
+    def on_heartbeat_success(self, count: int, latency_ms: float) -> None:
+        self.status_bar.heartbeat_label.setText(f"Heartbeats: {count} ({latency_ms:.1f}ms)")
+        self.status_bar.set_connection_status(True, f"Online ({latency_ms:.1f}ms)")
+
+    def on_heartbeat_error(self, err_msg: str) -> None:
+        self.status_bar.set_reconnecting_status(err_msg)
+
+    def handle_controller_command(self, cmd_value: str) -> None:
+        """Handle remote commands from controller."""
+        if cmd_value == WorkerCommand.EMERGENCY_STOP.value:
+            self.on_emergency_stop_clicked()
+        elif cmd_value == WorkerCommand.PAUSE.value:
+            self.on_pause_resume_clicked()
+        elif cmd_value == WorkerCommand.RESUME.value:
+            if self.controls_dock._is_paused:
+                self.on_pause_resume_clicked()
+
+    # -------------------------------------------------------------
+    # User Controls & Orb Interaction
+    # -------------------------------------------------------------
     def on_consent_toggled(self, checked: bool) -> None:
         """Handle explicit permission checkbox toggle."""
         self.capture_service.set_user_permission(checked)
@@ -572,182 +634,196 @@ class MainWindow(QMainWindow):
         self.status_bar.set_permission_status(checked)
 
         if checked:
-            self.start_btn.setEnabled(True)
-            self.preview_btn.setEnabled(True)
-            self.analyze_btn.setEnabled(True)
-            self.preview_widget.set_placeholder("Ready to capture. Click 'Start' or 'Capture Single Preview'.")
-            self.approved_frame_label.setText("Approved Frame: None (Click 'Capture Single Preview' to prepare)")
-            self.approved_frame_label.setStyleSheet("color: #ffb74d; font-size: 11px;")
-            self.append_log("User GRANTED explicit screen capture permission.")
+            self.approved_frame_label.setText("Consent Active • Standing by")
+            self.approved_frame_label.setStyleSheet("color: #00E676; font-size: 11px; font-weight: bold;")
+            self.orb_container.set_state(OrbState.IDLE)
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.VERIFY,
+                    title="Consent Granted",
+                    description="Student granted explicit screen capture permission",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
         else:
-            self.start_btn.setEnabled(False)
-            self.preview_btn.setEnabled(False)
-            self.analyze_btn.setEnabled(False)
             self.capture_service.clear_approved_frame()
+            if self.typing_thread and self.typing_thread.isRunning():
+                self.typing_thread.stop()
             self.approved_frame_label.setText("Approved Frame: Revoked (No Consent)")
-            self.approved_frame_label.setStyleSheet("color: #888888; font-size: 11px;")
-            if self.capture_service.has_permission:
-                self.on_stop_clicked()
-            self.preview_widget.set_placeholder("Screen Capture Inactive\n(Explicit user consent required)")
-            self.append_log("User REVOKED screen capture permission.")
-
-    def on_target_mode_changed(self, index: int) -> None:
-        """Handle target mode switch between monitor, window, and custom region."""
-        mode = self.target_mode_combo.currentData()
-        self.window_selection_widget.setVisible(mode == "window")
-        self.region_selection_widget.setVisible(mode == "region")
-        if mode == "window":
-            self.refresh_window_list()
-        self._apply_capture_targeting()
-
-    def refresh_window_list(self) -> None:
-        """Populate the window dropdown with open capturable windows, excluding NIAT CodePilot."""
-        self.window_combo.blockSignals(True)
-        self.window_combo.clear()
-        windows = list_capturable_windows(exclude_titles=("NIAT CodePilot",))
-        if not windows:
-            self.window_combo.addItem("No capturable windows found", None)
-        else:
-            for w in windows:
-                title = w["title"]
-                hwnd = w["hwnd"]
-                rect = w["rect"]
-                w_w = max(0, rect[2] - rect[0])
-                w_h = max(0, rect[3] - rect[1])
-                self.window_combo.addItem(f"{title[:40]} ({w_w}x{w_h})", hwnd)
-        self.window_combo.blockSignals(False)
-        self._apply_capture_targeting()
-
-    def on_window_selected(self, index: int) -> None:
-        """Handle selection of a different application window."""
-        self._apply_capture_targeting()
-
-    def _apply_capture_targeting(self) -> None:
-        """Propagate current UI target selection into the ScreenCaptureService."""
-        mode = self.target_mode_combo.currentData() or "monitor"
-        if mode == "window":
-            hwnd = self.window_combo.currentData()
-            title = self.window_combo.currentText()
-            self.capture_service.set_target_mode("window", window_hwnd=hwnd, window_title=title)
-        elif mode == "region":
-            x = self.region_x_spin.value()
-            y = self.region_y_spin.value()
-            w = self.region_w_spin.value()
-            h = self.region_h_spin.value()
-            self.capture_service.set_target_mode("region", region_rect=(x, y, w, h))
-        else:
-            self.capture_service.set_target_mode("monitor", monitor_index=1)
-
-    def on_start_clicked(self) -> None:
-        """Start worker registration, screen capture engine, and heartbeat loop."""
-        if not self.consent_checkbox.isChecked():
-            QMessageBox.warning(
-                self,
-                "Permission Required",
-                "Explicit user permission must be granted before starting screen capture.",
+            self.approved_frame_label.setStyleSheet("color: #FF5252; font-size: 11px; font-weight: bold;")
+            self.preview_widget.set_placeholder("Screen Capture Inactive\n(Consent Revoked)")
+            self.orb_container.set_state(OrbState.ERROR, "Consent revoked by user.")
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.ERROR,
+                    title="Consent Revoked",
+                    description="Screen capture permissions revoked. All interactions paused.",
+                    status=TimelineEventStatus.WARNING,
+                )
             )
+
+    def on_voice_toggled(self, active: bool) -> None:
+        if active:
+            self.orb_container.set_state(OrbState.LISTENING)
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.OBSERVE,
+                    title="Voice Mode Active",
+                    description="Listening for student voice queries...",
+                    status=TimelineEventStatus.IN_PROGRESS,
+                )
+            )
+        else:
+            self.orb_container.set_state(OrbState.IDLE)
+
+    def on_text_submitted(self, prompt: str) -> None:
+        self.orb_container.set_state(OrbState.THINKING, f"Consulting AI: '{prompt[:35]}...'")
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.ANALYZE,
+                title="Student Query",
+                description=f"Prompt: '{prompt}'",
+                status=TimelineEventStatus.IN_PROGRESS,
+            )
+        )
+        self.on_analyze_screen_clicked(additional_prompt=prompt)
+
+    def on_toggle_workspace(self) -> None:
+        is_visible = self.workspace_widget.isVisible()
+        self.workspace_widget.setVisible(not is_visible)
+        self.controls_dock.set_workspace_expanded(not is_visible)
+        if not is_visible:
+            self.body_splitter.setSizes([440, 880])
+        else:
+            self.body_splitter.setSizes([1200, 0])
+
+    def on_open_practice_editor(self) -> None:
+        """Open or focus the local practice editor test bed."""
+        if self.practice_editor is None:
+            self.practice_editor = PracticeEditorWindow()
+        self.practice_editor.show()
+        self.practice_editor.raise_()
+        self.practice_editor.activateWindow()
+
+        # Refresh windows so Practice Bed is listed at the top
+        self.refresh_window_list()
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.OBSERVE,
+                title="Practice Editor Launched",
+                description="Local test bed ready for focus detection, typing, and emergency stop testing",
+                status=TimelineEventStatus.SUCCESS,
+            )
+        )
+
+    def on_continuous_observe_toggled(self, observing: bool) -> None:
+        """Toggle continuous screen observation."""
+        if observing:
+            self.observe_timer.start()
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.OBSERVE,
+                    title="Live Observation Started",
+                    description="Monitoring target window continuously for coding questions and editor updates",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
+        else:
+            self.observe_timer.stop()
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.OBSERVE,
+                    title="Live Observation Stopped",
+                    description="Continuous screen observation paused",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
+
+    def on_continuous_observe_tick(self) -> None:
+        """Periodic observation loop."""
+        if not self.consent_checkbox.isChecked() or self.controls_dock._is_paused:
             return
-
-        # Update client configurations from inputs
-        self.worker_client.worker_id = self.worker_id_edit.text().strip()
-        self.worker_client.worker_name = self.worker_name_edit.text().strip()
-        self.worker_client.controller_url = self.controller_url_edit.text().strip()
-        user_secret = self.secret_key_edit.text().strip().strip("'\"")
-        self.worker_client.secret_key = user_secret or settings.controller_secret_key
-        self.capture_service.worker_id = self.worker_client.worker_id
-
-        self.append_log(f"Registering with controller at {self.worker_client.controller_url}...")
-
-        # Register synchronously or via coroutine runner
-        loop = asyncio.new_event_loop()
         try:
-            resp = loop.run_until_complete(self.worker_client.register(explicit_consent=True))
-            self.append_log(f"Registration acknowledged: {resp.message}")
-            self.status_bar.set_connection_status(True, f"ID: {resp.worker_id}")
+            b64_jpeg, meta = self.capture_service.capture_jpeg_base64(quality=settings.openai_jpeg_quality)
+            raw_bytes = base64.b64decode(b64_jpeg)
+            qimage = QImage.fromData(QByteArray(raw_bytes))
+            self.preview_widget.update_frame(QPixmap.fromImage(qimage))
+            self.approved_frame_label.setText(f"Approved Frame: {meta.width}x{meta.height} • Live")
         except Exception as e:
-            self.append_log(f"Registration error: {e}")
-            self.status_bar.set_connection_status(False, "Registration Failed")
-            QMessageBox.critical(
-                self,
-                "Registration Failed",
-                f"Could not connect to controller:\n{e}\n\nPlease check Controller URL and ensure the central controller is running.",
-            )
-            loop.close()
-            return
-        finally:
-            loop.close()
+            logger.debug(f"Continuous observation tick notice: {e}")
 
-        # Start capture service
-        try:
+    def on_pause_resume_clicked(self) -> None:
+        """Toggle capture pause/resume."""
+        if self.preview_timer.isActive():
+            self.preview_timer.stop()
+            self.observe_timer.stop()
+            self.capture_service.stop()
+            if self.typing_thread and self.typing_thread.isRunning():
+                self.typing_thread.toggle_pause()
+            self.controls_dock.set_paused_state(True)
+            self.orb_container.set_state(OrbState.IDLE, "Capture paused. AI assistant standing by.")
+            self.approved_frame_label.setText("Capture Paused")
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.PAUSE,
+                    title="Interaction Paused",
+                    description="Screen capture and agent keystrokes suspended by student",
+                    status=TimelineEventStatus.WARNING,
+                )
+            )
+        else:
             self.capture_service.start()
-        except Exception as e:
-            self.append_log(f"Error starting capture service: {e}")
-            return
-
-        # Start heartbeats
-        if self.heartbeat_thread is None or not self.heartbeat_thread.isRunning():
-            self.heartbeat_thread = HeartbeatWorkerThread(self.worker_client, self)
-            self.heartbeat_thread.heartbeat_success.connect(self.on_heartbeat_success)
-            self.heartbeat_thread.heartbeat_error.connect(self.on_heartbeat_error)
-            self.heartbeat_thread.command_received.connect(self.on_command_from_thread)
-            self.heartbeat_thread.start()
-
-        # Start auto preview timer
-        self.preview_timer.start()
-
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.worker_id_edit.setEnabled(False)
-        self.controller_url_edit.setEnabled(False)
-
-        self.append_log("Worker started successfully: Screen capture and heartbeats active.")
-
-    def on_stop_clicked(self) -> None:
-        """Stop worker operations gracefully."""
-        self.preview_timer.stop()
-
-        if self.heartbeat_thread and self.heartbeat_thread.isRunning():
-            self.heartbeat_thread.stop()
-            self.heartbeat_thread.wait(2000)
-
-        self.capture_service.stop()
-        self.worker_client.status = WorkerStatus.PAUSED
-
-        self.start_btn.setEnabled(self.consent_checkbox.isChecked())
-        self.stop_btn.setEnabled(False)
-        self.worker_id_edit.setEnabled(True)
-        self.controller_url_edit.setEnabled(True)
-
-        self.preview_widget.set_placeholder("Screen Capture Paused")
-        self.preview_info_label.setText("Frame status: Paused")
-        self.append_log("Worker paused: Screen capture and heartbeats halted.")
+            self.preview_timer.start()
+            if self.controls_dock._is_observing:
+                self.observe_timer.start()
+            if self.typing_thread and self.typing_thread.isRunning():
+                self.typing_thread.toggle_pause()
+            self.controls_dock.set_paused_state(False)
+            self.orb_container.set_state(OrbState.IDLE, "Capture resumed.")
+            self.approved_frame_label.setText("Capture Active")
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.PAUSE,
+                    title="Interaction Resumed",
+                    description="Screen capture and computer-use agent resumed",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
 
     def on_emergency_stop_clicked(self) -> None:
-        """Immediately abort all captures, revoke permissions, and halt."""
+        """Instantly terminate all screen captures, typing, and flush buffers."""
         self.preview_timer.stop()
+        self.observe_timer.stop()
         self.capture_service.emergency_halt()
+
+        if self.typing_thread and self.typing_thread.isRunning():
+            self.typing_thread.stop()
 
         if self.heartbeat_thread and self.heartbeat_thread.isRunning():
             self.heartbeat_thread.stop()
-            self.heartbeat_thread.wait(1000)
 
         self.worker_client.status = WorkerStatus.EMERGENCY_STOPPED
         self.consent_checkbox.setChecked(False)
 
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(False)
-        self.preview_btn.setEnabled(False)
-        self.analyze_btn.setEnabled(False)
-
-        self.preview_widget.set_placeholder("EMERGENCY STOP ACTIVATED\nAll screen capture instantly terminated.", is_emergency=True)
-        self.preview_info_label.setText("Status: EMERGENCY STOPPED")
+        self.orb_container.set_state(OrbState.ERROR, "EMERGENCY STOP ACTIVATED — All screen capture terminated.")
+        self.preview_widget.set_placeholder("EMERGENCY STOP ACTIVATED", is_emergency=True)
         self.approved_frame_label.setText("Approved Frame: Cleared (Emergency Stop)")
-        self.approved_frame_label.setStyleSheet("color: #d32f2f; font-size: 11px; font-weight: bold;")
+        self.approved_frame_label.setStyleSheet("color: #FF1744; font-size: 11px; font-weight: bold;")
         self.status_bar.set_permission_status(False)
         self.status_bar.set_connection_status(False, "Emergency Halted")
 
-        self.append_log("EMERGENCY STOP TRIGGERED. All permissions and capture loops terminated immediately.")
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.EMERGENCY_STOP,
+                title="EMERGENCY STOP TRIGGERED",
+                description="Instant halt: Keystrokes, captures, and permissions revoked immediately.",
+                status=TimelineEventStatus.FAILED,
+            )
+        )
 
+    # -------------------------------------------------------------
+    # Screen Capture & AI Analysis
+    # -------------------------------------------------------------
     def on_single_preview_clicked(self) -> None:
         """Capture and display a single frame on-demand and register as approved frame."""
         self._apply_capture_targeting()
@@ -757,31 +833,41 @@ class MainWindow(QMainWindow):
             qimage = QImage.fromData(QByteArray(raw_bytes))
             pixmap = QPixmap.fromImage(qimage)
             self.preview_widget.update_frame(pixmap, f"Target: {self.capture_service.target_mode.upper()} | {meta.width}x{meta.height}")
-            self.preview_info_label.setText(
-                f"Mode: {self.capture_service.target_mode.upper()} | Resolution: {meta.width}x{meta.height} | "
-                f"Size: {meta.frame_size_bytes / 1024:.1f} KB | Verified: Explicit Consent"
-            )
             self.approved_frame_label.setText(
-                f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Ready for AI"
+                f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Ready"
             )
-            self.approved_frame_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
-            self.append_log(f"Captured single frame preview ({self.capture_service.target_mode.upper()}, {meta.width}x{meta.height}, {meta.frame_size_bytes} bytes)")
+            self.approved_frame_label.setStyleSheet("color: #00E676; font-size: 11px; font-weight: bold;")
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.OBSERVE,
+                    title="Snapshot Captured",
+                    description=f"Captured {meta.width}x{meta.height} frame ({meta.frame_size_bytes / 1024:.1f} KB)",
+                    status=TimelineEventStatus.SUCCESS,
+                )
+            )
         except PermissionError as pe:
             QMessageBox.warning(self, "Permission Denied", str(pe))
-            self.append_log(f"Permission error: {pe}")
         except Exception as e:
-            self.append_log(f"Preview capture failed: {e}")
             self.approved_frame_label.setText(f"Capture Failed: {e}")
-            self.approved_frame_label.setStyleSheet("color: #f44336; font-size: 11px; font-weight: bold;")
+            self.approved_frame_label.setStyleSheet("color: #FF5252; font-size: 11px; font-weight: bold;")
+            self.orb_container.set_state(OrbState.ERROR, str(e))
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.ERROR,
+                    title="Capture Failed",
+                    description=str(e),
+                    status=TimelineEventStatus.FAILED,
+                )
+            )
             QMessageBox.warning(
                 self,
                 "Window Capture Failed",
-                f"Could not capture application window:\n\n{e}\n\n"
-                "Please ensure the application window is open, unminimized, and visible on your screen, then try again.",
+                f"Could not capture selected window:\n\n{e}\n\n"
+                "Please ensure the application window (e.g. Chrome NIAT Portal) is open, unminimized, and visible on your screen.",
             )
 
     def on_auto_preview_tick(self) -> None:
-        """Periodically grab a preview frame when worker is actively running."""
+        """Periodically grab a preview frame when capture is active."""
         if not self.capture_service.has_permission:
             return
         self._apply_capture_targeting()
@@ -791,33 +877,23 @@ class MainWindow(QMainWindow):
             qimage = QImage.fromData(QByteArray(raw_bytes))
             pixmap = QPixmap.fromImage(qimage)
             self.preview_widget.update_frame(pixmap)
-            self.preview_info_label.setText(
-                f"Mode: {self.capture_service.target_mode.upper()} | Resolution: {meta.width}x{meta.height} | "
-                f"Size: {meta.frame_size_bytes / 1024:.1f} KB | Active Preview"
-            )
-            self.approved_frame_label.setText(
-                f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Auto Updated"
-            )
-            self.approved_frame_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
-        except Exception as e:
-            self.append_log(f"Auto preview tick error: {e}")
+            self.approved_frame_label.setText(f"Approved Frame: {meta.width}x{meta.height} • Ready")
+            self.approved_frame_label.setStyleSheet("color: #00E676; font-size: 11px; font-weight: bold;")
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------------
-    # AI Screen Analysis
-    # ------------------------------------------------------------------
-    def on_analyze_screen_clicked(self) -> None:
-        """Analyze the approved screen capture frame using the configured AI provider."""
+    def on_analyze_screen_clicked(self, additional_prompt: str = "") -> None:
+        """One-click trigger: captures approved frame from NIAT Chrome window and analyzes with Gemini."""
         if not self.consent_checkbox.isChecked():
             QMessageBox.warning(
                 self,
                 "Permission Required",
-                "Explicit user permission must be granted before screen analysis.",
+                "Explicit user permission must be active before screen analysis.",
             )
             return
 
         self._apply_capture_targeting()
 
-        # Single source of truth: retrieve the current approved frame or capture one
         approved = self.capture_service.get_last_approved_frame()
         if approved is None:
             if not self.capture_service._is_active:
@@ -827,6 +903,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(self, "Permission Denied", str(pe))
                     return
 
+            self.orb_container.set_state(OrbState.ANALYZING_SCREEN)
             try:
                 b64_jpeg, meta = self.capture_service.capture_jpeg_base64(
                     quality=settings.openai_jpeg_quality,
@@ -835,188 +912,205 @@ class MainWindow(QMainWindow):
                 raw_bytes = base64.b64decode(b64_jpeg)
                 qimage = QImage.fromData(QByteArray(raw_bytes))
                 self.preview_widget.update_frame(QPixmap.fromImage(qimage), f"Captured: {meta.width}x{meta.height}")
-                self.approved_frame_label.setText(
-                    f"Approved Frame: {meta.width}x{meta.height} ({self.capture_service.target_mode.upper()}) — Ready for AI"
+                self.approved_frame_label.setText(f"Approved Frame: {meta.width}x{meta.height} • Analyzed")
+                self.approved_frame_label.setStyleSheet("color: #00E676; font-size: 11px; font-weight: bold;")
+                self.timeline_widget.add_event(
+                    TimelineEvent(
+                        event_type=TimelineEventType.OBSERVE,
+                        title="Screen Observed",
+                        description=f"Approved {meta.width}x{meta.height} frame for analysis",
+                        status=TimelineEventStatus.SUCCESS,
+                    )
                 )
-                self.approved_frame_label.setStyleSheet("color: #4CAF50; font-size: 11px; font-weight: bold;")
             except Exception as e:
-                self.append_log(f"Screenshot capture for AI failed: {e}")
+                self.orb_container.set_state(OrbState.ERROR, f"Capture failed: {e}")
                 self.approved_frame_label.setText(f"Capture Failed: {e}")
-                self.approved_frame_label.setStyleSheet("color: #f44336; font-size: 11px; font-weight: bold;")
+                self.approved_frame_label.setStyleSheet("color: #FF5252; font-size: 11px; font-weight: bold;")
+                self.timeline_widget.add_event(
+                    TimelineEvent(
+                        event_type=TimelineEventType.ERROR,
+                        title="Window Capture Failed",
+                        description=str(e),
+                        status=TimelineEventStatus.FAILED,
+                    )
+                )
                 QMessageBox.critical(
                     self,
                     "Window Capture Failed",
-                    f"Failed to capture application window for AI analysis:\n\n{e}\n\n"
-                    "Please ensure the window is open, unminimized, and visible on your screen, or select another window.",
+                    f"Failed to capture selected application window:\n\n{e}\n\n"
+                    "Please ensure the application window is open, unminimized, and visible on your screen.",
                 )
                 return
 
         b64_jpeg, meta = approved
         provider_name = settings.ai_provider.upper()
 
-        # Confirm student intent referencing the exact frame and provider
-        reply = QMessageBox.question(
-            self,
-            f"Confirm AI Screen Analysis ({provider_name})",
-            f"This will send the approved screen capture ({meta.width}x{meta.height}, {meta.frame_size_bytes / 1024:.1f} KB)\n"
-            f"to the configured AI provider ({provider_name}) for coding analysis.\n\n"
-            "• Both the preview and AI analysis use this identical captured frame.\n"
-            "• No passwords or personal data will be transmitted.\n"
-            "• No automatic portal submissions will be made.\n"
-            "• You must review all suggestions before using them.\n\n"
-            "Do you want to proceed?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self.append_log("AI analysis cancelled by student.")
-            return
-
-        self.append_log(
-            f"Submitting approved frame ({meta.width}x{meta.height}, {meta.frame_size_bytes / 1024:.1f} KB) to {provider_name}..."
+        self.orb_container.set_state(OrbState.THINKING, f"Transmitting approved frame to {provider_name}...")
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.ANALYZE,
+                title="AI Vision Analysis Started",
+                description=f"Sending approved frame to {provider_name} ({settings.gemini_model})...",
+                status=TimelineEventStatus.IN_PROGRESS,
+            )
         )
 
-        # Show loading state
-        self._set_ai_loading(True)
-        self.analyze_btn.setEnabled(False)
-
-        # Switch to AI tab
-        self.right_tabs.setCurrentIndex(1)
-
-        # Launch analysis in background thread
-        additional = self.additional_prompt_edit.text().strip()
         self.ai_thread = AIAnalysisThread(
             ai_engine=self.ai_engine,
             image_base64=b64_jpeg,
             worker_id=self.capture_service.worker_id,
-            additional_prompt=additional,
+            additional_prompt=additional_prompt,
             parent=self,
         )
         self.ai_thread.analysis_complete.connect(self.on_ai_analysis_complete)
         self.ai_thread.analysis_error.connect(self.on_ai_analysis_error)
         self.ai_thread.start()
 
-    def _set_ai_loading(self, loading: bool) -> None:
-        """Toggle the AI loading indicator visibility."""
-        self.ai_progress.setVisible(loading)
-        if loading:
-            self.ai_loading_label.setText("🔄 Analyzing screen with AI... Please wait.")
-            self.ai_error_label.setVisible(False)
-        else:
-            self.ai_loading_label.setText("")
-
     def on_ai_analysis_complete(self, result: CodingAnalysisResult) -> None:
-        """Display structured AI analysis results in the UI."""
-        self._set_ai_loading(False)
-        self.analyze_btn.setEnabled(self.consent_checkbox.isChecked())
+        """Handle structured result: update orb to responding and populate coding workspace."""
+        self.orb_container.set_state(OrbState.RESPONDING, f"Analysis complete: '{result.problem_title}'")
+        self.workspace_widget.populate_results(result)
 
-        # Problem title & description
-        self.problem_title_label.setText(f"📋 {result.problem_title}")
-        self.problem_desc_text.setPlainText(result.problem_description or "No problem description extracted.")
-        if result.programming_language:
-            self.problem_title_label.setText(
-                f"📋 {result.problem_title}  [{result.programming_language}]"
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.ANALYZE,
+                title="Coding Task Recognized",
+                description=f"'{result.problem_title}' [{result.programming_language or 'Python'}]. Concepts: {', '.join(result.relevant_concepts[:3])}",
+                status=TimelineEventStatus.SUCCESS,
+            )
+        )
+
+        if not self.workspace_widget.isVisible():
+            self.on_toggle_workspace()
+
+    def on_ai_analysis_error(self, error_message: str) -> None:
+        """Handle AI analysis failure gracefully."""
+        self.orb_container.set_state(OrbState.ERROR, f"AI Error: {error_message}")
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.ERROR,
+                title="AI Analysis Error",
+                description=error_message,
+                status=TimelineEventStatus.FAILED,
+            )
+        )
+        QMessageBox.critical(
+            self,
+            "AI Analysis Failed",
+            f"An error occurred during Gemini AI screen analysis:\n\n{error_message}\n\n"
+            "Please check your API key, network connection, or try again.",
+        )
+        QTimer.singleShot(4000, lambda: self.orb_container.set_state(OrbState.IDLE))
+
+    # -------------------------------------------------------------
+    # Keyboard Computer-Use Interaction (No Clipboard Paste)
+    # -------------------------------------------------------------
+    def on_type_code_clicked(self) -> None:
+        """Authorize and execute keyboard code entry into the focused editor in controlled chunks."""
+        if not self.consent_checkbox.isChecked():
+            QMessageBox.warning(
+                self,
+                "Permission Required",
+                "Explicit student permission must be active before typing code.",
+            )
+            return
+
+        target_hwnd = self.capture_service.target_hwnd
+        target_title = self.capture_service.target_window_title or self.window_combo.currentText()
+
+        if not target_hwnd:
+            QMessageBox.warning(
+                self,
+                "Target Required",
+                "Please select an application window (e.g. Google Chrome or Practice Bed) first.",
+            )
+            return
+
+        # Obtain code to type
+        code_to_type = ""
+        if self.workspace_widget._current_result and self.workspace_widget._current_result.suggested_code:
+            code_to_type = self.workspace_widget._current_result.suggested_code
+        else:
+            # Default practice algorithm if workspace hasn't run yet
+            code_to_type = (
+                "def solve(nums):\n"
+                "    \"\"\"Generated by NIAT CodePilot Computer-Use Agent.\"\"\"\n"
+                "    total = 0\n"
+                "    for x in nums:\n"
+                "        total += x\n"
+                "    return total\n"
             )
 
-        # Step-by-step explanation
-        explanation_parts = []
-        if result.constraints:
-            explanation_parts.append("Constraints:")
-            for c in result.constraints:
-                explanation_parts.append(f"  • {c}")
-            explanation_parts.append("")
+        # Safety Confirmation Dialog: Student retains 100% control
+        reply = QMessageBox.question(
+            self,
+            "Authorize Keyboard Code Entry",
+            f"Do you want NIAT CodePilot to type the solution into:\n'{target_title}'?\n\n"
+            "• ZERO clipboard paste: Keystrokes are sent via Windows SendInput.\n"
+            "• Controlled chunks: Verified focus before and after each chunk.\n"
+            "• Instant stop: Typing halts immediately if editor loses focus or STOP is pressed.\n"
+            "• Student control: Code execution and final portal submission are NEVER automated.\n\n"
+            "Proceed with keyboard typing?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.timeline_widget.add_event(
+                TimelineEvent(
+                    event_type=TimelineEventType.VERIFY,
+                    title="Typing Cancelled",
+                    description="Student declined keyboard code entry",
+                    status=TimelineEventStatus.WARNING,
+                )
+            )
+            return
 
-        if result.input_format:
-            explanation_parts.append(f"Input Format: {result.input_format}")
-        if result.output_format:
-            explanation_parts.append(f"Output Format: {result.output_format}")
-        if result.input_format or result.output_format:
-            explanation_parts.append("")
+        self.orb_container.set_state(OrbState.ANALYZING_SCREEN, "Focusing editor & initiating keyboard entry...")
 
-        if result.sample_inputs or result.sample_outputs:
-            for i, (si, so) in enumerate(
-                zip(
-                    result.sample_inputs or [],
-                    result.sample_outputs or [],
-                ),
-                1,
-            ):
-                explanation_parts.append(f"Sample {i}:")
-                explanation_parts.append(f"  Input:  {si}")
-                explanation_parts.append(f"  Output: {so}")
-            explanation_parts.append("")
+        self.typing_thread = InteractiveTypingWorkerThread(
+            target_hwnd=target_hwnd,
+            target_title=target_title,
+            code_to_type=code_to_type,
+            parent=self,
+        )
+        self.typing_thread.timeline_event_signal.connect(self.on_typing_timeline_event)
+        self.typing_thread.typing_complete.connect(self.on_typing_complete)
+        self.typing_thread.typing_error.connect(self.on_typing_error)
+        self.typing_thread.start()
 
-        if result.step_by_step_explanation:
-            explanation_parts.append("Explanation:")
-            for step in result.step_by_step_explanation:
-                explanation_parts.append(f"  {step}")
+    def on_typing_timeline_event(self, event: TimelineEvent) -> None:
+        """Route typing events to the Action Timeline and update the Orb state."""
+        self.timeline_widget.add_event(event)
+        if event.event_type == TimelineEventType.TYPE_CHUNK:
+            pct = event.metadata.get("progress_pct", 50)
+            self.orb_container.set_state(OrbState.ANALYZING_SCREEN, f"Typing code via keyboard... ({pct}%)")
 
-        if result.code_explanation:
-            explanation_parts.append("")
-            explanation_parts.append("Code Walkthrough:")
-            explanation_parts.append(result.code_explanation)
+    def on_typing_complete(self, success: bool) -> None:
+        if success:
+            self.orb_container.set_state(OrbState.RESPONDING, "Keyboard entry completed. Ready for student review.")
+            QMessageBox.information(
+                self,
+                "Keyboard Entry Complete",
+                "CodePilot has finished typing the solution into your editor.\n\n"
+                "• All code was typed directly via keyboard input.\n"
+                "• Please review your code, run local test cases, and make any adjustments before submitting.",
+            )
+        else:
+            self.orb_container.set_state(OrbState.IDLE)
 
-        self.explanation_text.setPlainText("\n".join(explanation_parts) if explanation_parts else "No explanation available.")
-
-        # Suggested code
-        self.code_text.setPlainText(result.suggested_code or "# No code suggestion generated.")
-
-        # Edge cases & concepts
-        extra_parts = []
-        if result.relevant_concepts:
-            extra_parts.append("Relevant Concepts:")
-            for concept in result.relevant_concepts:
-                extra_parts.append(f"  • {concept}")
-            extra_parts.append("")
-
-        if result.edge_cases:
-            extra_parts.append("Edge Cases:")
-            for ec in result.edge_cases:
-                line = f"  • {ec.description}"
-                if ec.example_input:
-                    line += f" (input: {ec.example_input})"
-                if ec.expected_behavior:
-                    line += f" → {ec.expected_behavior}"
-                extra_parts.append(line)
-
-        if result.confidence_note:
-            extra_parts.append("")
-            extra_parts.append(f"Confidence: {result.confidence_note}")
-
-        self.extra_info_text.setPlainText("\n".join(extra_parts) if extra_parts else "No additional information.")
-
-        self.append_log(f"AI analysis complete: '{result.problem_title}'")
-
-    def on_ai_analysis_error(self, error: str) -> None:
-        """Display AI analysis error in the UI."""
-        self._set_ai_loading(False)
-        self.analyze_btn.setEnabled(self.consent_checkbox.isChecked())
-        self.ai_error_label.setText(f"❌ Analysis Error: {error}")
-        self.ai_error_label.setVisible(True)
-        self.append_log(f"AI analysis error: {error}")
-
-    # ------------------------------------------------------------------
-    # Heartbeat callbacks
-    # ------------------------------------------------------------------
-    def on_heartbeat_success(self, count: int, latency: float) -> None:
-        self.status_bar.update_heartbeat_count(count, latency)
-
-    def on_heartbeat_error(self, error: str) -> None:
-        self.append_log(f"Heartbeat dispatch error: {error}")
-        self.status_bar.set_connection_status(False, "Error")
-
-    def on_command_from_thread(self, command: str) -> None:
-        self.append_log(f"Controller command received: {command}")
-        if command == WorkerCommand.EMERGENCY_STOP.value:
-            self.on_emergency_stop_clicked()
-        elif command == WorkerCommand.STOP.value:
-            self.on_stop_clicked()
-
-    def handle_controller_command(self, cmd: WorkerCommand) -> None:
-        if cmd == WorkerCommand.EMERGENCY_STOP:
-            self.on_emergency_stop_clicked()
-
-    def closeEvent(self, event) -> None:
-        """Cleanly shutdown threads on window close."""
-        self.on_stop_clicked()
-        event.accept()
+    def on_typing_error(self, error_message: str) -> None:
+        self.orb_container.set_state(OrbState.ERROR, f"Typing halted: {error_message}")
+        self.timeline_widget.add_event(
+            TimelineEvent(
+                event_type=TimelineEventType.ERROR,
+                title="Typing Interrupted",
+                description=error_message,
+                status=TimelineEventStatus.FAILED,
+            )
+        )
+        QMessageBox.warning(
+            self,
+            "Typing Halted",
+            f"Keyboard code entry was halted:\n\n{error_message}\n\n"
+            "Safety invariant preserved: Typing stops whenever editor focus changes or an error occurs.",
+        )

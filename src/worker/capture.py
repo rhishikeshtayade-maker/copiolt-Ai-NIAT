@@ -12,48 +12,151 @@ from src.common.schemas import ScreenCaptureMetadata, current_utc_time
 logger = get_logger("Worker.ScreenCapture")
 
 
+def init_dpi_awareness() -> None:
+    """Ensure process is DPI-aware so window capture coordinates align with physical pixels."""
+    try:
+        import ctypes
+        try:
+            # Per-Monitor DPI Aware v2 (Windows 10 1703+)
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def list_capturable_windows(
     exclude_titles: Tuple[str, ...] = ("NIAT CodePilot",),
 ) -> List[Dict[str, Any]]:
-    """Enumerate visible application windows on the desktop, excluding NIAT CodePilot itself.
+    """Enumerate visible application windows on the desktop, excluding NIAT CodePilot and system shells.
+
+    Uses dual enumeration (Default interactive desktop + standard EnumWindows) to reliably
+    discover Google Chrome (NIAT portal), IDEs, and user applications regardless of background session context.
 
     Returns a list of dicts:
     [
-        {"hwnd": int, "title": str, "rect": {"left": int, "top": int, "width": int, "height": int}}
+        {
+            "hwnd": int,
+            "title": str,
+            "rect": (left, top, right, bottom),
+            "bounds": {"left": int, "top": int, "width": int, "height": int}
+        }
     ]
     """
+    init_dpi_awareness()
     windows: List[Dict[str, Any]] = []
+    seen_hwnds = set()
+
+    def process_hwnd(hwnd: int) -> None:
+        if hwnd in seen_hwnds:
+            return
+        seen_hwnds.add(hwnd)
+
+        try:
+            import win32gui
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return
+
+            title = win32gui.GetWindowText(hwnd).strip()
+            if not title:
+                return
+
+            # Exclude NIAT CodePilot and desktop system shells
+            if any(ex.lower() in title.lower() for ex in exclude_titles):
+                return
+            if title.lower() in ("program manager", "task switching", "windows input experience"):
+                return
+
+            # Check Windows DWM cloaking (e.g. apps on other virtual desktops)
+            try:
+                import ctypes
+                dwmapi = ctypes.windll.dwmapi
+                cloaked = ctypes.c_int(0)
+                dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if cloaked.value != 0:
+                    return
+            except Exception:
+                pass
+
+            rect = win32gui.GetWindowRect(hwnd)  # (left, top, right, bottom)
+            width = rect[2] - rect[0]
+            height = rect[3] - rect[1]
+
+            cls_name = ""
+            try:
+                cls_name = win32gui.GetClassName(hwnd)
+            except Exception:
+                pass
+
+            is_browser = (
+                "chrome" in cls_name.lower()
+                or "chrome" in title.lower()
+                or "niat" in title.lower()
+                or "edge" in cls_name.lower()
+            )
+
+            if width > 50 and height > 50:
+                windows.append(
+                    {
+                        "hwnd": hwnd,
+                        "title": title,
+                        "class_name": cls_name,
+                        "is_browser": is_browser,
+                        "rect": (rect[0], rect[1], rect[2], rect[3]),
+                        "bounds": {
+                            "left": rect[0],
+                            "top": rect[1],
+                            "width": width,
+                            "height": height,
+                        },
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Error checking window {hwnd}: {e}")
+
+    # Method 1: EnumDesktopWindows on interactive 'default' desktop
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        h_desk = user32.OpenDesktopW("default", 0, False, 0x0100)  # DESKTOP_ENUMERATE
+        if h_desk:
+            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+            def desk_cb(hwnd: int, _: int) -> bool:
+                process_hwnd(hwnd)
+                return True
+
+            user32.EnumDesktopWindows(h_desk, WNDENUMPROC(desk_cb), 0)
+            user32.CloseDesktop(h_desk)
+    except Exception as e:
+        logger.debug(f"Desktop enumeration notice: {e}")
+
+    # Method 2: Standard EnumWindows fallback (also honors mocked win32gui in unit tests)
     try:
         import win32gui
 
-        def enum_handler(hwnd: int, _: Any) -> bool:
-            if win32gui.IsWindowVisible(hwnd) and not win32gui.IsIconic(hwnd):
-                title = win32gui.GetWindowText(hwnd).strip()
-                if title:
-                    # Exclude the NIAT CodePilot application itself
-                    if not any(ex.lower() in title.lower() for ex in exclude_titles):
-                        rect = win32gui.GetWindowRect(hwnd)  # (left, top, right, bottom)
-                        width = rect[2] - rect[0]
-                        height = rect[3] - rect[1]
-                        # Exclude hidden zero-sized or tiny toolbars
-                        if width > 50 and height > 50:
-                            windows.append(
-                                {
-                                    "hwnd": hwnd,
-                                    "title": title,
-                                    "rect": {
-                                        "left": rect[0],
-                                        "top": rect[1],
-                                        "width": width,
-                                        "height": height,
-                                    },
-                                }
-                            )
+        def std_cb(hwnd: int, _: Any) -> bool:
+            process_hwnd(hwnd)
             return True
 
-        win32gui.EnumWindows(enum_handler, None)
+        win32gui.EnumWindows(std_cb, None)
     except Exception as e:
-        logger.debug(f"Window enumeration error: {e}")
+        logger.debug(f"Standard EnumWindows notice: {e}")
+
+    # Prioritize coding practice, Chrome / NIAT portals, and editors at the top of the list
+    windows.sort(
+        key=lambda w: (
+            not any(
+                k in w["title"].lower() or k in w.get("class_name", "").lower()
+                for k in ("niat", "practice", "chrome", "leetcode", "code")
+            ),
+            w["title"].lower(),
+        )
+    )
 
     return windows
 
