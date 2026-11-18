@@ -1,6 +1,7 @@
 """Main PySide6 application window for the NIAT CodePilot Worker."""
 
 import asyncio
+import base64
 import io
 import time
 from typing import Optional
@@ -15,7 +16,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSplitter,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -24,8 +29,10 @@ from PySide6.QtWidgets import (
 from src.common.config import settings
 from src.common.constants import WorkerCommand, WorkerStatus
 from src.common.logger import get_logger
+from src.common.schemas import CodingAnalysisResult
 from src.desktop.components.preview_widget import ScreenPreviewWidget
 from src.desktop.components.status_bar import ConnectionStatusBar
+from src.worker.ai_engine import AIEngineService
 from src.worker.capture import ScreenCaptureService
 from src.worker.client import WorkerClient
 
@@ -77,13 +84,54 @@ class HeartbeatWorkerThread(QThread):
         self.running = False
 
 
+class AIAnalysisThread(QThread):
+    """Background thread running async AI analysis without blocking the Qt GUI."""
+
+    analysis_complete = Signal(object)  # CodingAnalysisResult
+    analysis_error = Signal(str)
+    analysis_started = Signal()
+
+    def __init__(
+        self,
+        ai_engine: AIEngineService,
+        image_base64: str,
+        worker_id: str,
+        additional_prompt: str = "",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.ai_engine = ai_engine
+        self.image_base64 = image_base64
+        self.worker_id = worker_id
+        self.additional_prompt = additional_prompt
+
+    def run(self) -> None:
+        self.analysis_started.emit()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.ai_engine.analyze_screen(
+                    image_base64=self.image_base64,
+                    worker_id=self.worker_id,
+                    additional_prompt=self.additional_prompt,
+                )
+            )
+            self.analysis_complete.emit(result)
+        except Exception as e:
+            logger.error(f"AI analysis thread error: {e}")
+            self.analysis_error.emit(str(e))
+        finally:
+            loop.close()
+
+
 class MainWindow(QMainWindow):
     """Central graphical window for the NIAT CodePilot Worker laptop."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("NIAT CodePilot - Distributed Worker & Screen Capture")
-        self.resize(1000, 720)
+        self.resize(1200, 800)
 
         # Worker services
         self.capture_service = ScreenCaptureService(worker_id=settings.worker_id)
@@ -93,8 +141,10 @@ class MainWindow(QMainWindow):
             controller_url=settings.controller_url,
             on_command_received=self.handle_controller_command,
         )
+        self.ai_engine = AIEngineService()
 
         self.heartbeat_thread: Optional[HeartbeatWorkerThread] = None
+        self.ai_thread: Optional[AIAnalysisThread] = None
 
         # Preview refresh timer
         self.preview_timer = QTimer(self)
@@ -118,6 +168,8 @@ class MainWindow(QMainWindow):
         self.worker_id_edit = QLineEdit(settings.worker_id)
         self.worker_name_edit = QLineEdit(settings.worker_name)
         self.controller_url_edit = QLineEdit(settings.controller_url)
+        self.secret_key_edit = QLineEdit(settings.controller_secret_key)
+        self.secret_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
 
         form1 = QFormLayout()
         form1.addRow("Worker ID:", self.worker_id_edit)
@@ -130,6 +182,10 @@ class MainWindow(QMainWindow):
         form3 = QFormLayout()
         form3.addRow("Controller URL:", self.controller_url_edit)
         config_layout.addLayout(form3)
+
+        form4 = QFormLayout()
+        form4.addRow("Secret Key:", self.secret_key_edit)
+        config_layout.addLayout(form4)
 
         main_layout.addWidget(config_group)
 
@@ -155,11 +211,14 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(permission_group)
 
-        # 3. Main Center Split (Left: Controls & Logs, Right: Preview)
-        content_layout = QHBoxLayout()
+        # 3. Main Center Splitter (Left: Controls & Logs, Right: Preview + AI)
+        content_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Left Column: Buttons & Logs
-        left_column = QVBoxLayout()
+        left_widget = QWidget()
+        left_column = QVBoxLayout(left_widget)
+        left_column.setContentsMargins(0, 0, 0, 0)
+
         controls_group = QGroupBox("Execution Controls")
         btn_layout = QVBoxLayout(controls_group)
 
@@ -190,6 +249,16 @@ class MainWindow(QMainWindow):
         self.preview_btn.clicked.connect(self.on_single_preview_clicked)
         btn_layout.addWidget(self.preview_btn)
 
+        # Analyze Screen button
+        self.analyze_btn = QPushButton("🧠  Analyze Screen with AI")
+        self.analyze_btn.setEnabled(False)
+        self.analyze_btn.setFixedHeight(42)
+        self.analyze_btn.setStyleSheet(
+            "background-color: #7b1fa2; color: white; font-weight: bold; font-size: 13px; border-radius: 4px;"
+        )
+        self.analyze_btn.clicked.connect(self.on_analyze_screen_clicked)
+        btn_layout.addWidget(self.analyze_btn)
+
         self.emergency_btn = QPushButton("🚨  EMERGENCY STOP")
         self.emergency_btn.setFixedHeight(48)
         self.emergency_btn.setStyleSheet(
@@ -212,6 +281,16 @@ class MainWindow(QMainWindow):
 
         left_column.addWidget(controls_group)
 
+        # Additional prompt input
+        prompt_group = QGroupBox("Additional Question (Optional)")
+        prompt_layout = QVBoxLayout(prompt_group)
+        self.additional_prompt_edit = QLineEdit()
+        self.additional_prompt_edit.setPlaceholderText(
+            "e.g. 'Explain the time complexity' or 'Show a recursive approach'"
+        )
+        prompt_layout.addWidget(self.additional_prompt_edit)
+        left_column.addWidget(prompt_group)
+
         # Log box
         log_group = QGroupBox("Activity & Security Log")
         log_layout = QVBoxLayout(log_group)
@@ -223,30 +302,159 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_text)
         left_column.addWidget(log_group)
 
-        content_layout.addLayout(left_column, stretch=4)
+        content_splitter.addWidget(left_widget)
 
-        # Right Column: Screen Preview
-        right_column = QVBoxLayout()
-        preview_group = QGroupBox("Live Screen Capture Preview")
-        preview_layout = QVBoxLayout(preview_group)
+        # Right Column: Tabbed Preview + AI Results
+        right_widget = QWidget()
+        right_column = QVBoxLayout(right_widget)
+        right_column.setContentsMargins(0, 0, 0, 0)
 
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setStyleSheet(
+            """
+            QTabWidget::pane { border: 1px solid #3c3c3c; background: #1e1e1e; }
+            QTabBar::tab { background: #2d2d2d; color: #cccccc; padding: 6px 14px; border: 1px solid #3c3c3c; border-bottom: none; }
+            QTabBar::tab:selected { background: #1e1e1e; color: #ffffff; }
+            QTabBar::tab:hover { background: #3c3c3c; }
+            """
+        )
+
+        # Tab 1: Screen Preview
+        preview_tab = QWidget()
+        preview_layout = QVBoxLayout(preview_tab)
         self.preview_widget = ScreenPreviewWidget(self)
         preview_layout.addWidget(self.preview_widget)
-
         self.preview_info_label = QLabel("Frame status: Inactive")
         self.preview_info_label.setStyleSheet("color: #888888; font-size: 11px;")
         preview_layout.addWidget(self.preview_info_label)
+        self.right_tabs.addTab(preview_tab, "📺 Screen Preview")
 
-        right_column.addWidget(preview_group)
-        content_layout.addLayout(right_column, stretch=6)
+        # Tab 2: AI Analysis Results
+        ai_tab = QWidget()
+        ai_layout = QVBoxLayout(ai_tab)
 
-        main_layout.addLayout(content_layout)
+        # Loading indicator
+        self.ai_progress = QProgressBar()
+        self.ai_progress.setRange(0, 0)  # Indeterminate
+        self.ai_progress.setVisible(False)
+        self.ai_progress.setFixedHeight(6)
+        self.ai_progress.setStyleSheet(
+            "QProgressBar { border: none; background: #2d2d2d; }"
+            "QProgressBar::chunk { background: #7b1fa2; }"
+        )
+        ai_layout.addWidget(self.ai_progress)
+
+        self.ai_loading_label = QLabel("")
+        self.ai_loading_label.setStyleSheet("color: #bb86fc; font-weight: bold; font-size: 12px;")
+        self.ai_loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ai_layout.addWidget(self.ai_loading_label)
+
+        # Scrollable results area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #1e1e1e; }")
+        scroll_content = QWidget()
+        self.ai_results_layout = QVBoxLayout(scroll_content)
+        self.ai_results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # Problem Description
+        self.problem_title_label = QLabel("")
+        self.problem_title_label.setStyleSheet(
+            "color: #ffffff; font-size: 16px; font-weight: bold; padding: 4px 0;"
+        )
+        self.problem_title_label.setWordWrap(True)
+        self.ai_results_layout.addWidget(self.problem_title_label)
+
+        self.problem_desc_text = QTextEdit()
+        self.problem_desc_text.setReadOnly(True)
+        self.problem_desc_text.setMaximumHeight(120)
+        self.problem_desc_text.setStyleSheet(
+            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; "
+            "border-radius: 4px; font-size: 12px; padding: 6px;"
+        )
+        self.ai_results_layout.addWidget(self.problem_desc_text)
+
+        # Explanation
+        expl_label = QLabel("Step-by-Step Explanation")
+        expl_label.setStyleSheet("color: #4FC3F7; font-weight: bold; font-size: 13px; margin-top: 8px;")
+        self.ai_results_layout.addWidget(expl_label)
+
+        self.explanation_text = QTextEdit()
+        self.explanation_text.setReadOnly(True)
+        self.explanation_text.setMinimumHeight(120)
+        self.explanation_text.setStyleSheet(
+            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; "
+            "border-radius: 4px; font-size: 12px; padding: 6px;"
+        )
+        self.ai_results_layout.addWidget(self.explanation_text)
+
+        # Suggested Code
+        code_label = QLabel("Suggested Code (Requires Student Review)")
+        code_label.setStyleSheet("color: #81C784; font-weight: bold; font-size: 13px; margin-top: 8px;")
+        self.ai_results_layout.addWidget(code_label)
+
+        self.code_text = QTextEdit()
+        self.code_text.setReadOnly(True)
+        self.code_text.setMinimumHeight(140)
+        self.code_text.setStyleSheet(
+            "background-color: #1a1a2e; color: #a5d6a7; border: 1px solid #3c3c3c; "
+            "border-radius: 4px; font-family: Consolas, 'Courier New', monospace; font-size: 12px; padding: 6px;"
+        )
+        self.ai_results_layout.addWidget(self.code_text)
+
+        # Edge Cases & Concepts
+        extra_label = QLabel("Concepts & Edge Cases")
+        extra_label.setStyleSheet("color: #FFB74D; font-weight: bold; font-size: 13px; margin-top: 8px;")
+        self.ai_results_layout.addWidget(extra_label)
+
+        self.extra_info_text = QTextEdit()
+        self.extra_info_text.setReadOnly(True)
+        self.extra_info_text.setMinimumHeight(100)
+        self.extra_info_text.setStyleSheet(
+            "background-color: #252526; color: #d4d4d4; border: 1px solid #3c3c3c; "
+            "border-radius: 4px; font-size: 12px; padding: 6px;"
+        )
+        self.ai_results_layout.addWidget(self.extra_info_text)
+
+        # Error display
+        self.ai_error_label = QLabel("")
+        self.ai_error_label.setStyleSheet(
+            "color: #ff5252; font-weight: bold; font-size: 12px; padding: 6px;"
+        )
+        self.ai_error_label.setWordWrap(True)
+        self.ai_error_label.setVisible(False)
+        self.ai_results_layout.addWidget(self.ai_error_label)
+
+        # Student approval reminder
+        self.approval_label = QLabel(
+            "⚠ All suggestions require YOUR explicit review and approval before use. "
+            "No automatic submissions will be made."
+        )
+        self.approval_label.setStyleSheet(
+            "color: #FFD54F; font-size: 11px; font-weight: bold; padding: 6px; margin-top: 8px;"
+        )
+        self.approval_label.setWordWrap(True)
+        self.ai_results_layout.addWidget(self.approval_label)
+
+        scroll.setWidget(scroll_content)
+        ai_layout.addWidget(scroll)
+        self.right_tabs.addTab(ai_tab, "🧠 AI Analysis")
+
+        right_column.addWidget(self.right_tabs)
+        content_splitter.addWidget(right_widget)
+
+        content_splitter.setStretchFactor(0, 4)
+        content_splitter.setStretchFactor(1, 6)
+
+        main_layout.addWidget(content_splitter)
 
         # 4. Status Bar
         self.status_bar = ConnectionStatusBar(self)
         main_layout.addWidget(self.status_bar)
 
         self.append_log("NIAT CodePilot Worker initialized. Awaiting explicit user consent.")
+        api_status = "configured" if self.ai_engine.is_configured else "NOT configured (mock mode)"
+        self.append_log(f"AI Engine: OpenAI API {api_status} | Model: {self.ai_engine.model}")
 
     def _apply_dark_styles(self) -> None:
         self.setStyleSheet(
@@ -293,11 +501,13 @@ class MainWindow(QMainWindow):
         if checked:
             self.start_btn.setEnabled(True)
             self.preview_btn.setEnabled(True)
+            self.analyze_btn.setEnabled(True)
             self.preview_widget.set_placeholder("Ready to capture. Click 'Start' or 'Capture Single Preview'.")
             self.append_log("User GRANTED explicit screen capture permission.")
         else:
             self.start_btn.setEnabled(False)
             self.preview_btn.setEnabled(False)
+            self.analyze_btn.setEnabled(False)
             if self.capture_service.has_permission:
                 self.on_stop_clicked()
             self.preview_widget.set_placeholder("Screen Capture Inactive\n(Explicit user consent required)")
@@ -317,6 +527,8 @@ class MainWindow(QMainWindow):
         self.worker_client.worker_id = self.worker_id_edit.text().strip()
         self.worker_client.worker_name = self.worker_name_edit.text().strip()
         self.worker_client.controller_url = self.controller_url_edit.text().strip()
+        user_secret = self.secret_key_edit.text().strip().strip("'\"")
+        self.worker_client.secret_key = user_secret or settings.controller_secret_key
         self.capture_service.worker_id = self.worker_client.worker_id
 
         self.append_log(f"Registering with controller at {self.worker_client.controller_url}...")
@@ -400,6 +612,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.preview_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
 
         self.preview_widget.set_placeholder("EMERGENCY STOP ACTIVATED\nAll screen capture instantly terminated.", is_emergency=True)
         self.preview_info_label.setText("Status: EMERGENCY STOPPED")
@@ -440,6 +653,181 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.append_log(f"Auto preview tick error: {e}")
 
+    # ------------------------------------------------------------------
+    # AI Screen Analysis
+    # ------------------------------------------------------------------
+    def on_analyze_screen_clicked(self) -> None:
+        """Capture a JPEG screenshot and send it for AI analysis."""
+        if not self.consent_checkbox.isChecked():
+            QMessageBox.warning(
+                self,
+                "Permission Required",
+                "Explicit user permission must be granted before screen analysis.",
+            )
+            return
+
+        # Confirm student intent
+        reply = QMessageBox.question(
+            self,
+            "Confirm AI Screen Analysis",
+            "This will capture your current screen and send it to the OpenAI API for coding analysis.\n\n"
+            "• No passwords or personal data will be transmitted.\n"
+            "• No automatic portal submissions will be made.\n"
+            "• You must review all suggestions before using them.\n\n"
+            "Do you want to proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            self.append_log("AI analysis cancelled by student.")
+            return
+
+        # Ensure capture service is ready
+        if not self.capture_service._is_active:
+            # Allow one-shot capture without full start
+            try:
+                self.capture_service.start()
+            except PermissionError as pe:
+                QMessageBox.warning(self, "Permission Denied", str(pe))
+                return
+
+        # Capture JPEG screenshot
+        try:
+            b64_jpeg, meta = self.capture_service.capture_jpeg_base64(
+                quality=settings.openai_jpeg_quality,
+            )
+        except Exception as e:
+            self.append_log(f"Screenshot capture for AI failed: {e}")
+            QMessageBox.critical(self, "Capture Error", f"Failed to capture screenshot:\n{e}")
+            return
+
+        self.append_log(
+            f"Captured JPEG for AI analysis ({meta.width}x{meta.height}, "
+            f"{meta.frame_size_bytes / 1024:.1f} KB)"
+        )
+
+        # Show loading state
+        self._set_ai_loading(True)
+        self.analyze_btn.setEnabled(False)
+
+        # Switch to AI tab
+        self.right_tabs.setCurrentIndex(1)
+
+        # Launch analysis in background thread
+        additional = self.additional_prompt_edit.text().strip()
+        self.ai_thread = AIAnalysisThread(
+            ai_engine=self.ai_engine,
+            image_base64=b64_jpeg,
+            worker_id=self.capture_service.worker_id,
+            additional_prompt=additional,
+            parent=self,
+        )
+        self.ai_thread.analysis_complete.connect(self.on_ai_analysis_complete)
+        self.ai_thread.analysis_error.connect(self.on_ai_analysis_error)
+        self.ai_thread.start()
+
+    def _set_ai_loading(self, loading: bool) -> None:
+        """Toggle the AI loading indicator visibility."""
+        self.ai_progress.setVisible(loading)
+        if loading:
+            self.ai_loading_label.setText("🔄 Analyzing screen with AI... Please wait.")
+            self.ai_error_label.setVisible(False)
+        else:
+            self.ai_loading_label.setText("")
+
+    def on_ai_analysis_complete(self, result: CodingAnalysisResult) -> None:
+        """Display structured AI analysis results in the UI."""
+        self._set_ai_loading(False)
+        self.analyze_btn.setEnabled(self.consent_checkbox.isChecked())
+
+        # Problem title & description
+        self.problem_title_label.setText(f"📋 {result.problem_title}")
+        self.problem_desc_text.setPlainText(result.problem_description or "No problem description extracted.")
+        if result.programming_language:
+            self.problem_title_label.setText(
+                f"📋 {result.problem_title}  [{result.programming_language}]"
+            )
+
+        # Step-by-step explanation
+        explanation_parts = []
+        if result.constraints:
+            explanation_parts.append("Constraints:")
+            for c in result.constraints:
+                explanation_parts.append(f"  • {c}")
+            explanation_parts.append("")
+
+        if result.input_format:
+            explanation_parts.append(f"Input Format: {result.input_format}")
+        if result.output_format:
+            explanation_parts.append(f"Output Format: {result.output_format}")
+        if result.input_format or result.output_format:
+            explanation_parts.append("")
+
+        if result.sample_inputs or result.sample_outputs:
+            for i, (si, so) in enumerate(
+                zip(
+                    result.sample_inputs or [],
+                    result.sample_outputs or [],
+                ),
+                1,
+            ):
+                explanation_parts.append(f"Sample {i}:")
+                explanation_parts.append(f"  Input:  {si}")
+                explanation_parts.append(f"  Output: {so}")
+            explanation_parts.append("")
+
+        if result.step_by_step_explanation:
+            explanation_parts.append("Explanation:")
+            for step in result.step_by_step_explanation:
+                explanation_parts.append(f"  {step}")
+
+        if result.code_explanation:
+            explanation_parts.append("")
+            explanation_parts.append("Code Walkthrough:")
+            explanation_parts.append(result.code_explanation)
+
+        self.explanation_text.setPlainText("\n".join(explanation_parts) if explanation_parts else "No explanation available.")
+
+        # Suggested code
+        self.code_text.setPlainText(result.suggested_code or "# No code suggestion generated.")
+
+        # Edge cases & concepts
+        extra_parts = []
+        if result.relevant_concepts:
+            extra_parts.append("Relevant Concepts:")
+            for concept in result.relevant_concepts:
+                extra_parts.append(f"  • {concept}")
+            extra_parts.append("")
+
+        if result.edge_cases:
+            extra_parts.append("Edge Cases:")
+            for ec in result.edge_cases:
+                line = f"  • {ec.description}"
+                if ec.example_input:
+                    line += f" (input: {ec.example_input})"
+                if ec.expected_behavior:
+                    line += f" → {ec.expected_behavior}"
+                extra_parts.append(line)
+
+        if result.confidence_note:
+            extra_parts.append("")
+            extra_parts.append(f"Confidence: {result.confidence_note}")
+
+        self.extra_info_text.setPlainText("\n".join(extra_parts) if extra_parts else "No additional information.")
+
+        self.append_log(f"AI analysis complete: '{result.problem_title}'")
+
+    def on_ai_analysis_error(self, error: str) -> None:
+        """Display AI analysis error in the UI."""
+        self._set_ai_loading(False)
+        self.analyze_btn.setEnabled(self.consent_checkbox.isChecked())
+        self.ai_error_label.setText(f"❌ Analysis Error: {error}")
+        self.ai_error_label.setVisible(True)
+        self.append_log(f"AI analysis error: {error}")
+
+    # ------------------------------------------------------------------
+    # Heartbeat callbacks
+    # ------------------------------------------------------------------
     def on_heartbeat_success(self, count: int, latency: float) -> None:
         self.status_bar.update_heartbeat_count(count, latency)
 

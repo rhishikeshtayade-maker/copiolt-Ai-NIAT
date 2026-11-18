@@ -3,6 +3,7 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 from src.controller.main import create_app
+from src.common.config import settings
 from src.common.constants import WorkerCommand, WorkerStatus
 
 
@@ -25,6 +26,7 @@ async def test_health_endpoint(app):
 @pytest.mark.asyncio
 async def test_worker_registration_and_heartbeat_flow(app):
     transport = ASGITransport(app=app)
+    auth_headers = {"X-Worker-Token": settings.controller_secret_key}
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # 1. Register with consent = False should return 403 Forbidden
         reg_payload_denied = {
@@ -33,7 +35,7 @@ async def test_worker_registration_and_heartbeat_flow(app):
             "hostname": "test-box",
             "explicit_consent_granted": False,
         }
-        resp = await client.post("/api/v1/workers/register", json=reg_payload_denied)
+        resp = await client.post("/api/v1/workers/register", json=reg_payload_denied, headers=auth_headers)
         assert resp.status_code == 403
 
         # 2. Register with consent = True should succeed
@@ -44,7 +46,7 @@ async def test_worker_registration_and_heartbeat_flow(app):
             "ip_address": "127.0.0.1",
             "explicit_consent_granted": True,
         }
-        resp = await client.post("/api/v1/workers/register", json=reg_payload_ok)
+        resp = await client.post("/api/v1/workers/register", json=reg_payload_ok, headers=auth_headers)
         assert resp.status_code == 201
         data = resp.json()
         assert data["status"] == "registered"
@@ -64,7 +66,7 @@ async def test_worker_registration_and_heartbeat_flow(app):
             "memory_percent": 44.0,
             "permission_active": True,
         }
-        resp = await client.post("/api/v1/workers/heartbeat", json=hb_payload)
+        resp = await client.post("/api/v1/workers/heartbeat", json=hb_payload, headers=auth_headers)
         assert resp.status_code == 200
         hb_data = resp.json()
         assert hb_data["acknowledged"] is True
@@ -80,7 +82,7 @@ async def test_worker_registration_and_heartbeat_flow(app):
         assert "worker-api-01" in stop_data["affected_workers"]
 
         # 6. Next heartbeat must receive EMERGENCY_STOP command
-        resp = await client.post("/api/v1/workers/heartbeat", json=hb_payload)
+        resp = await client.post("/api/v1/workers/heartbeat", json=hb_payload, headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json()["command"] == "EMERGENCY_STOP"
 

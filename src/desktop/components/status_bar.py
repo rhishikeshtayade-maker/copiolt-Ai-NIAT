@@ -52,7 +52,11 @@ class ConnectionStatusBar(QFrame):
             self.conn_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
         else:
             self.conn_label.setText(f"Controller: Disconnected ({message})" if message else "Controller: Disconnected")
-            self.conn_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
+            self.conn_label.setStyleSheet("color: #f44336; font-weight: bold;")
+
+    def set_reconnecting_status(self, message: str = "") -> None:
+        self.conn_label.setText(f"Controller: Reconnecting ({message})" if message else "Controller: Reconnecting...")
+        self.conn_label.setStyleSheet("color: #ffaa00; font-weight: bold;")
 
     def set_permission_status(self, granted: bool) -> None:
         if granted:

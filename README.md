@@ -1,8 +1,9 @@
 # NIAT CodePilot
 
 **NIAT CodePilot** is a distributed desktop AI coding assistant designed for collaborative, multi-machine educational environments. In this architecture:
-- **Laptop 1 (Controller)**: Central coordinator running a FastAPI backend that registers worker nodes, monitors real-time health heartbeats, coordinates tasks, and provides administrative oversight.
-- **Laptop 2 & Laptop 3 (Workers)**: Independent worker machines running PySide6 desktop applications capable of capturing permitted screen regions with **explicit student consent**, transmitting frames for AI coding guidance, and presenting explanations.
+- **Laptop 1 (Controller)**: Central coordinator running a FastAPI backend on LAN (`0.0.0.0:8000`) that authenticates and registers worker nodes, tracks real-time health heartbeats, coordinates worker-isolated tasks, and provides an interactive live web dashboard.
+- **Laptop 2 (Worker Alpha)**: Independent worker machine (`worker-laptop-01`) running the PySide6 desktop application capable of capturing permitted screen regions with **explicit student consent**, transmitting frames for AI coding guidance, and presenting explanations.
+- **Laptop 3 (Worker Beta)**: Independent worker machine (`worker-laptop-02`) running concurrently on the same network with unique identity, isolated task queues, and independent screen capture consent.
 
 ---
 
@@ -13,14 +14,19 @@ NIAT CodePilot strictly enforces the following security boundaries across all co
 1. **Explicit Permission Required for Screen Capture**:
    - The screen capture engine will **refuse to capture any frames** unless the student has explicitly checked the consent agreement in the desktop UI (`REQUIRE_EXPLICIT_PERMISSION=true`).
    - Screen capture can be revoked at any instant or halted immediately via the Emergency Stop button.
-2. **Never Hardcode Credentials**:
-   - All credentials (OpenAI API keys, Supabase URLs, secret tokens) are loaded strictly via environment variables or a local `.env` file.
+2. **Never Hardcode Credentials & Authenticated Registration**:
+   - All credentials (OpenAI / Gemini API keys, Supabase URLs, shared controller secrets) are loaded strictly via environment variables or a local `.env` file.
+   - Worker registration and heartbeats require a shared secret key (`CONTROLLER_SECRET_KEY`).
 3. **No Student Password Storage**:
    - The application does not solicit, log, or persist user passwords or institutional credentials.
 4. **No Automated Portal Submissions**:
    - The platform strictly forbids bot-like automated submissions, anti-bot circumvention, or clandestine web automation.
 5. **Student Approval for Consequential Actions**:
    - All AI-generated explanations, advice, and suggested code diffs must be manually reviewed, accepted, or applied by the student.
+6. **Task & Identity Isolation**:
+   - Unique worker IDs prevent identity conflicts. Tasks assigned to Worker Alpha can never be polled or executed by Worker Beta.
+7. **Zero Exposure of Secrets in Logs and Dashboard**:
+   - API keys, student credentials, and screenshot image payloads are never exposed on the web dashboard or recorded in audit logs.
 
 ---
 
@@ -28,197 +34,238 @@ NIAT CodePilot strictly enforces the following security boundaries across all co
 
 ```mermaid
 flowchart TD
-    subgraph Controller_Machine ["Laptop 1: Central Controller"]
+    subgraph Controller_Machine ["Laptop 1: Central Controller (0.0.0.0:8000)"]
         FastAPI["FastAPI Controller (Port 8000)"]
-        WM["Worker Manager & Health Monitor"]
-        DB["Supabase Audit Logs (with In-Memory Fallback)"]
-        FastAPI --> WM
-        FastAPI --> DB
+        Dashboard["Live Web Dashboard (/dashboard)"]
+        WM["Worker Manager & Health Tracker"]
+        Auth["Shared Secret Token Guard (X-Worker-Token)"]
+        TQ["Worker-Scoped Task Queues"]
+        DB["Supabase Audit Logs (Local Fallback)"]
+        FastAPI --> Dashboard
+        FastAPI --> Auth --> WM
+        WM --> TQ
+        WM --> DB
     end
 
-    subgraph Worker_1 ["Laptop 2: Worker Machine Alpha"]
+    subgraph Worker_1 ["Laptop 2: Worker Alpha (worker-laptop-01)"]
         UI1["PySide6 Desktop Application"]
         Cap1["MSS Screen Capture Service"]
-        Client1["Worker HTTP Client"]
+        Client1["Worker HTTP Client (Auto-Reconnect)"]
         Consent1["Explicit Consent Guard"]
+        AI1["Google Gemini / OpenAI Vision Engine"]
         UI1 --> Consent1 --> Cap1
         UI1 --> Client1
+        UI1 --> AI1
     end
 
-    subgraph Worker_2 ["Laptop 3: Worker Machine Beta"]
+    subgraph Worker_2 ["Laptop 3: Worker Beta (worker-laptop-02)"]
         UI2["PySide6 Desktop Application"]
         Cap2["MSS Screen Capture Service"]
-        Client2["Worker HTTP Client"]
+        Client2["Worker HTTP Client (Auto-Reconnect)"]
         Consent2["Explicit Consent Guard"]
+        AI2["Google Gemini / OpenAI Vision Engine"]
         UI2 --> Consent2 --> Cap2
         UI2 --> Client2
+        UI2 --> AI2
     end
 
-    Client1 -- "Heartbeats & Registration (HTTP)" --> FastAPI
-    Client2 -- "Heartbeats & Registration (HTTP)" --> FastAPI
+    Client1 -- "Authenticated Heartbeats & Registration" --> FastAPI
+    Client2 -- "Authenticated Heartbeats & Registration" --> FastAPI
+    FastAPI -- "Task Queued for Alpha Only" --> Client1
+    FastAPI -- "Task Queued for Beta Only" --> Client2
 ```
 
 ---
 
-## 📁 Project Structure
+## 🌐 Network Requirements for 3-Laptop Wi-Fi Setup
 
-```
-niat-codepilot/
-├── .env.example                # Environment variables template
-├── README.md                   # System documentation & setup guide
-├── pyproject.toml              # Build & dependency metadata
-├── requirements.txt            # Python package requirements
-├── scripts/
-│   ├── run_controller.py       # Central controller CLI launcher
-│   └── run_worker.py           # Worker desktop application launcher
-├── src/
-│   ├── common/
-│   │   ├── config.py           # Pydantic Settings & environment loader
-│   │   ├── constants.py        # Worker statuses, commands, and ethical policies
-│   │   ├── logger.py           # Structured logging
-│   │   └── schemas.py          # Pydantic data models & contracts
-│   ├── controller/
-│   │   ├── db.py               # Supabase database integration & local fallback
-│   │   ├── manager.py          # Worker lifecycle, heartbeat tracker & stale reaper
-│   │   ├── main.py             # FastAPI app factory and background lifespan
-│   │   └── routes/
-│   │       ├── health.py       # Health check endpoint
-│   │       ├── workers.py      # Registration, heartbeat, status & emergency stops
-│   │       └── tasks.py        # Safe task queue & anti-submission enforcement
-│   ├── worker/
-│   │   ├── capture.py          # MSS screen capture with explicit consent guards
-│   │   ├── client.py           # Async HTTP client communicating with Controller
-│   │   └── ai_engine.py        # OpenAI API vision/reasoning service
-│   └── desktop/
-│       ├── main.py             # PySide6 desktop client entrypoint
-│       ├── app.py              # MainWindow with Start, Stop, Emergency Stop, Consent & Preview
-│       └── components/
-│           ├── preview_widget.py # Live/snapshot screen capture display
-│           └── status_bar.py     # Connection, permission & heartbeat status pills
-└── tests/
-    ├── test_schemas.py         # Schema validation unit tests
-    ├── test_screen_capture.py  # MSS permission and emergency stop unit tests
-    ├── test_worker_manager.py  # Worker state & stale reaper tests
-    └── test_controller_api.py  # FastAPI integration & security route tests
-```
+1. **Same Wi-Fi Router / Mobile Hotspot**:
+   - All three laptops must connect to the same local Wi-Fi network (or router Ethernet).
+   - Ensure the Wi-Fi network profile on Windows is set to **Private Network** (not Public) so machines can discover each other.
+2. **Laptop 1 (Controller) Port 8000 Accessibility**:
+   - The central controller listens on `0.0.0.0:8000` (all network adapters).
+   - Windows Defender Firewall on Laptop 1 must allow inbound TCP connections on port 8000.
+3. **Shared Secret Token**:
+   - All three laptops must share the same `CONTROLLER_SECRET_KEY` in their `.env` file (or via the desktop UI / CLI parameter).
 
 ---
 
-## 💻 Windows 10 Installation & Quickstart
+## 💻 Windows 10/11 Step-by-Step PowerShell Setup
 
-### Prerequisites
-- Windows 10 (or 11) 64-bit
-- Python 3.12 or 3.13 installed ([python.org](https://www.python.org/downloads/))
-  *Ensure **"Add Python to PATH"** is checked during installation.*
-- All three laptops connected to the same Local Area Network (Wi-Fi or Ethernet router).
+### Step 1: Clone or Copy Repository to All 3 Laptops
 
----
-
-### Step 1: Clone or Copy the Repository
-Open PowerShell or Command Prompt on all laptops and navigate to the project directory:
+Open PowerShell as Administrator on each laptop:
 ```powershell
 cd "D:\NIAT copolit"
 ```
 
-### Step 2: Create a Virtual Environment & Install Dependencies
-On each laptop:
+### Step 2: Set Up Virtual Environment & Dependencies
+
+Run this on all three laptops:
 ```powershell
+# Create Python virtual environment
 python -m venv .venv
+
+# Activate virtual environment
 .\.venv\Scripts\Activate.ps1
+
+# Install requirements
 pip install -r requirements.txt
 ```
 
-### Step 3: Configure Environment Variables
-Copy `.env.example` to `.env`:
-```powershell
-Copy-Item .env.example .env
-```
-
-If you plan to use OpenAI or Supabase, open `.env` in Notepad and insert your credentials:
-```ini
-OPENAI_API_KEY=sk-...
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-supabase-key
-```
-*(If omitted, NIAT CodePilot automatically operates in local memory fallback mode).*
-
 ---
 
-## 🚀 Running the System
+### Step 3: Configure Laptop 1 (Central Controller)
 
-### Machine 1: Central Controller Laptop
-
-1. Find the local IPv4 address of Laptop 1:
+1. **Find Laptop 1's LAN IP Address**:
+   In PowerShell on Laptop 1:
    ```powershell
+   (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Wi-Fi*").IPAddress
+   # Alternatively:
    ipconfig
    ```
-   *Look for `IPv4 Address`, for example: `192.168.1.100`.*
+   *Example output: `192.168.1.100` — note this IP address!*
 
-2. Launch the Central Controller:
+2. **Allow Port 8000 through Windows Firewall on Laptop 1**:
+   Run in an elevated PowerShell on Laptop 1:
+   ```powershell
+   New-NetFirewallRule -DisplayName "NIAT CodePilot Controller" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow
+   ```
+
+3. **Configure `.env` on Laptop 1**:
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+   Edit `.env` and configure:
+   ```ini
+   CONTROLLER_HOST=0.0.0.0
+   CONTROLLER_PORT=8000
+   CONTROLLER_SECRET_KEY=niat-secure-shared-key-2026
+   AI_PROVIDER=gemini
+   GEMINI_API_KEY=your-gemini-key
+   GEMINI_MODEL=gemini-flash-lite-latest
+   ```
+
+4. **Launch the Controller**:
    ```powershell
    python scripts\run_controller.py --host 0.0.0.0 --port 8000
    ```
-   *The controller will start and bind to `http://0.0.0.0:8000`.*
-   You can verify it in your browser at `http://localhost:8000/health` or `http://localhost:8000/docs` (interactive Swagger UI).
+
+5. **Open the Central Web Dashboard**:
+   Open your browser on Laptop 1 (or any browser on the LAN):
+   - **Dashboard**: `http://localhost:8000/dashboard` (or `http://192.168.1.100:8000/dashboard`)
+   - **Interactive API Docs**: `http://localhost:8000/docs`
+   - **Health Check**: `http://localhost:8000/health`
 
 ---
 
-### Machine 2: Worker Laptop 1 (Alpha)
+### Step 4: Configure Laptop 2 (Worker Alpha)
 
-Launch Worker 1 pointing to the Controller IP:
-```powershell
-python scripts\run_worker.py --id worker-laptop-01 --name "Worker Alpha" --controller http://192.168.1.100:8000
-```
+1. **Configure `.env` on Laptop 2**:
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+   Set:
+   ```ini
+   CONTROLLER_URL=http://192.168.1.100:8000
+   CONTROLLER_SECRET_KEY=niat-secure-shared-key-2026
+   WORKER_ID=worker-laptop-01
+   WORKER_NAME=Worker Alpha
+   AI_PROVIDER=gemini
+   GEMINI_API_KEY=your-gemini-key
+   GEMINI_MODEL=gemini-flash-lite-latest
+   ```
 
-1. The desktop interface will open.
-2. Verify the **Worker ID** and **Controller URL**.
-3. Check the **Explicit Consent** box:
-   *`"I EXPLICITLY GRANT PERMISSION for NIAT CodePilot to capture my screen..."`*
-4. Click **"▶ Start Worker & Capture"**:
-   - The worker registers with Laptop 1.
-   - Heartbeats begin pulsing every 5 seconds.
-   - Screen capture initializes.
-5. Click **"📷 Capture Single Preview"** or observe the live preview pane.
+2. **Launch Worker Alpha**:
+   ```powershell
+   python scripts\run_worker.py --id worker-laptop-01 --name "Worker Alpha" --controller http://192.168.1.100:8000
+   ```
+
+3. **In the PySide6 Desktop GUI**:
+   - Confirm Worker ID is `worker-laptop-01` and Controller URL is `http://192.168.1.100:8000`.
+   - Check the **"I EXPLICITLY GRANT PERMISSION..."** consent box.
+   - Click **"▶ Start Worker & Capture"**.
+   - Notice the status bar turns green (`Controller: Connected (ID: worker-laptop-01)`).
+   - Check Laptop 1's Dashboard: **Worker Alpha** appears immediately with real-time CPU/RAM gauges and heartbeat count!
 
 ---
 
-### Machine 3: Worker Laptop 2 (Beta)
+### Step 5: Configure Laptop 3 (Worker Beta)
 
-Launch Worker 2 on the third laptop:
-```powershell
-python scripts\run_worker.py --id worker-laptop-02 --name "Worker Beta" --controller http://192.168.1.100:8000
-```
+1. **Configure `.env` on Laptop 3**:
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+   Set:
+   ```ini
+   CONTROLLER_URL=http://192.168.1.100:8000
+   CONTROLLER_SECRET_KEY=niat-secure-shared-key-2026
+   WORKER_ID=worker-laptop-02
+   WORKER_NAME=Worker Beta
+   AI_PROVIDER=gemini
+   GEMINI_API_KEY=your-gemini-key
+   GEMINI_MODEL=gemini-flash-lite-latest
+   ```
 
-Repeat the consent and start steps. Both workers will now appear registered and monitored on the central controller.
+2. **Launch Worker Beta**:
+   ```powershell
+   python scripts\run_worker.py --id worker-laptop-02 --name "Worker Beta" --controller http://192.168.1.100:8000
+   ```
+
+3. **In the PySide6 Desktop GUI**:
+   - Check the **"I EXPLICITLY GRANT PERMISSION..."** consent box.
+   - Click **"▶ Start Worker & Capture"**.
+   - Laptop 1's Dashboard now displays **both Worker Alpha and Worker Beta** simultaneously in real-time!
+
+---
+
+## 📡 Fault Tolerance & Reconnection
+
+- **Automatic Reconnection**:
+  If the Wi-Fi connection drops or the controller restarts, the worker client detects the network disruption, marks its status as `RECONNECTING`, and automatically re-registers with the controller using exponential backoff once the network recovers.
+- **Heartbeat Expiry & Stale Reaper**:
+  If a worker loses power or disconnects without stopping, the controller marks it `OFFLINE` after 15 seconds of inactivity.
+- **Duplicate Worker ID Prevention**:
+  If another machine attempts to register with an already-active worker ID (`worker-laptop-01`), the controller rejects the conflicting registration with `409 Conflict`.
+- **Worker-Isolated Task Queuing**:
+  Tasks assigned to `worker-laptop-01` are held in an isolated queue that only `worker-laptop-01` can poll.
 
 ---
 
 ## 🚨 Emergency Stop Controls
 
 - **Worker Desktop UI**:
-  Clicking the large red **"🚨 EMERGENCY STOP"** button immediately:
-  1. Revokes the user permission flag.
-  2. Aborts active screen capturing in MSS.
-  3. Halts background heartbeat routines.
-  4. Flushes the screen preview buffer and watermarks the UI as stopped.
-- **Controller Remote Emergency Stop**:
-  The controller can remotely trigger an emergency halt across any or all workers via the API:
-  ```powershell
-  curl -X POST http://localhost:8000/api/v1/workers/emergency-stop
-  ```
-  On the next heartbeat pulse, the worker receives the `EMERGENCY_STOP` command and immediately disables all capture and processing.
+  Clicking the large red **"🚨 EMERGENCY STOP"** button immediately revokes permission, aborts MSS screen capture, halts heartbeats, and flushes the preview buffer.
+- **Controller Dashboard Emergency Stop**:
+  The operator sitting at Laptop 1 can click **"Halt Worker"** on any worker card or click **"🛑 EMERGENCY STOP ALL"** to immediately issue a halt command across all connected laptops.
 
 ---
 
-## 🧪 Running Unit Tests
+## 🧪 Automated Test Suite
 
-Run the full automated test suite using `pytest`:
+Run the complete test suite using `pytest`:
 ```powershell
 pytest -v
 ```
 
-All 16 unit tests cover:
-- Pydantic schema validation & bounds checking
-- Screen capture permission guards and emergency halt mechanics
-- Central worker manager lifecycle, registration, and stale reaper
-- FastAPI routes, registration flows, heartbeats, and anti-bot submission blocks
+All **57 automated tests** pass:
+- **Distributed Deployment & LAN Tests (`tests/test_distributed_deployment.py`)**:
+  - Two-worker concurrent registration (Worker Alpha + Worker Beta).
+  - Shared secret authentication enforcement and rejection (401).
+  - Duplicate worker ID conflict prevention across different hosts (409).
+  - Same-host reconnection and session renewal.
+  - Heartbeat expiry and stale worker reaping.
+  - Worker client auto-reconnection resilience.
+  - Worker-scoped task queue isolation.
+  - Multi-worker remote emergency stop.
+  - Central controller web dashboard endpoints.
+- **Controller API & Security (`tests/test_controller_api.py`)**:
+  - Health checks, registration flows, heartbeat pulses, anti-bot submission prevention.
+- **Worker Management (`tests/test_worker_manager.py`)**:
+  - State tracking, metrics collection, and emergency commands.
+- **Screen Capture & Permission Guard (`tests/test_screen_capture.py`)**:
+  - Explicit consent enforcement, preview frames, emergency halt.
+- **AI Vision Engine & PII Scrubbing (`tests/test_ai_engine.py`)**:
+  - Google Gemini multimodal vision pipeline, synthetic coding-problem integration test, prompt sanitization, error handling, structured Pydantic response parsing.
+- **Pydantic Schemas (`tests/test_schemas.py`)**:
+  - Data contracts and payload validation.

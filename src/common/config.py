@@ -1,8 +1,15 @@
 """Application settings loaded from environment variables."""
 
 import os
+from pathlib import Path
+from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
+
+# Compute absolute path to project root to ensure .env is discovered
+# regardless of current working directory when processes are launched.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_ENV_FILE = PROJECT_ROOT / ".env"
 
 
 class AppSettings(BaseSettings):
@@ -15,6 +22,13 @@ class AppSettings(BaseSettings):
         default="niat-default-secret-key-change-in-prod",
         alias="CONTROLLER_SECRET_KEY",
     )
+
+    @field_validator("controller_secret_key", mode="before")
+    @classmethod
+    def clean_secret_key(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return v.strip().strip("'\"")
+        return str(v) if v is not None else ""
 
     # Worker Settings
     controller_url: str = Field(
@@ -44,12 +58,28 @@ class AppSettings(BaseSettings):
     supabase_url: str = Field(default="", alias="SUPABASE_URL")
     supabase_key: str = Field(default="", alias="SUPABASE_KEY")
 
-    # OpenAI (Optional for vision/reasoning)
+    # AI Provider Settings ("gemini" or "openai")
+    ai_provider: str = Field(default="gemini", alias="AI_PROVIDER")
+
+    # Google Gemini Settings
+    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-flash-lite-latest", alias="GEMINI_MODEL")
+    gemini_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta/openai/",
+        alias="GEMINI_BASE_URL",
+    )
+
+    # OpenAI Settings
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
+    openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
+    openai_max_tokens: int = Field(default=4096, alias="OPENAI_MAX_TOKENS")
+    openai_timeout_seconds: float = Field(default=60.0, alias="OPENAI_TIMEOUT_SECONDS")
+    openai_max_retries: int = Field(default=3, alias="OPENAI_MAX_RETRIES")
+    openai_jpeg_quality: int = Field(default=75, ge=10, le=95, alias="OPENAI_JPEG_QUALITY")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(_ENV_FILE, ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

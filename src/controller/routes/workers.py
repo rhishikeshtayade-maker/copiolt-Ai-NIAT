@@ -1,7 +1,7 @@
 """Worker lifecycle, registration, and heartbeat endpoints."""
 
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, status
 from src.common.logger import get_logger
 from src.common.schemas import (
     EmergencyStopRequest,
@@ -18,14 +18,43 @@ logger = get_logger("Controller.Routes.Workers")
 router = APIRouter(prefix="/api/v1/workers", tags=["Workers"])
 
 
+def extract_auth_token(
+    x_worker_token: Optional[str] = None,
+    authorization: Optional[str] = None,
+    body_token: Optional[str] = None,
+) -> Optional[str]:
+    """Extract auth token from X-Worker-Token header, Authorization Bearer header, or body."""
+    if x_worker_token and x_worker_token.strip():
+        return x_worker_token.strip().strip("'\"")
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization[7:].strip().strip("'\"")
+    if body_token and body_token.strip():
+        return body_token.strip().strip("'\"")
+    return None
+
+
 @router.post(
     "/register",
     response_model=WorkerRegistrationResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Register a new worker laptop",
 )
-async def register_worker(request: WorkerRegistrationRequest):
-    """Register a worker laptop. Explicit user permission must be confirmed in the request."""
+async def register_worker(
+    request: WorkerRegistrationRequest,
+    x_worker_token: Optional[str] = Header(None, alias="X-Worker-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    """Register a worker laptop. Explicit user permission and valid auth token required."""
+    token = extract_auth_token(x_worker_token, authorization, request.auth_token)
+    if not worker_manager.validate_auth(token):
+        logger.warning(
+            f"Registration rejected for worker '{request.worker_id}': Invalid or missing shared secret."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing controller secret key.",
+        )
+
     try:
         response = await worker_manager.register_worker(request)
         return response
@@ -33,6 +62,11 @@ async def register_worker(request: WorkerRegistrationRequest):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(pe),
+        )
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(ve),
         )
     except Exception as e:
         logger.error(f"Worker registration failure: {e}")
@@ -47,8 +81,22 @@ async def register_worker(request: WorkerRegistrationRequest):
     response_model=HeartbeatResponse,
     summary="Worker heartbeat and health pulse",
 )
-async def worker_heartbeat(request: HeartbeatRequest):
+async def worker_heartbeat(
+    request: HeartbeatRequest,
+    x_worker_token: Optional[str] = Header(None, alias="X-Worker-Token"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     """Receive worker heartbeat, record metrics, and return queued control commands."""
+    token = extract_auth_token(x_worker_token, authorization, request.auth_token)
+    if not worker_manager.validate_auth(token):
+        logger.warning(
+            f"Heartbeat rejected for worker '{request.worker_id}': Invalid or missing shared secret."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Invalid or missing controller secret key.",
+        )
+
     try:
         response = await worker_manager.process_heartbeat(request)
         return response

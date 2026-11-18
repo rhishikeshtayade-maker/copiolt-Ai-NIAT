@@ -19,8 +19,14 @@ def main():
     parser.add_argument("--host", default=settings.controller_host, help="Host address (default 0.0.0.0)")
     parser.add_argument("--port", type=int, default=settings.controller_port, help="Port (default 8000)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
+    parser.add_argument("--secret", default=None, help="Controller secret key (overrides CONTROLLER_SECRET_KEY in .env)")
 
     args = parser.parse_args()
+
+    if args.secret:
+        clean_secret = args.secret.strip().strip("'\"")
+        settings.controller_secret_key = clean_secret
+        os.environ["CONTROLLER_SECRET_KEY"] = clean_secret
 
     logger.info(f"Starting NIAT CodePilot Controller on http://{args.host}:{args.port}")
     uvicorn.run("src.controller.main:app", host=args.host, port=args.port, reload=args.reload)

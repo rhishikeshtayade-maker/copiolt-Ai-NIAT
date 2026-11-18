@@ -1,6 +1,8 @@
 """Worker management service: registers, tracks health, and issues control commands."""
 
 import asyncio
+import secrets
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from src.common.config import settings
@@ -9,6 +11,9 @@ from src.common.logger import get_logger
 from src.common.schemas import (
     HeartbeatRequest,
     HeartbeatResponse,
+    TaskAssignmentRequest,
+    TaskAssignmentResponse,
+    TaskItem,
     WorkerInfo,
     WorkerRegistrationRequest,
     WorkerRegistrationResponse,
@@ -24,13 +29,24 @@ class WorkerManager:
 
     def __init__(self) -> None:
         self._workers: Dict[str, WorkerInfo] = {}
+        self._worker_tasks: Dict[str, List[TaskItem]] = {}
         self._lock = asyncio.Lock()
         self._timeout_seconds = settings.heartbeat_timeout_seconds
+
+    def validate_auth(self, token: Optional[str]) -> bool:
+        """Verify that the provided token matches the configured controller secret key in constant time."""
+        configured_secret = (settings.controller_secret_key or "").strip().strip("'\"")
+        if not configured_secret:
+            return True  # No auth required if secret is unset
+        if not token:
+            return False
+        clean_token = str(token).strip().strip("'\"")
+        return secrets.compare_digest(clean_token, configured_secret)
 
     async def register_worker(
         self, req: WorkerRegistrationRequest
     ) -> WorkerRegistrationResponse:
-        """Register a new worker laptop after verifying explicit consent."""
+        """Register a new worker laptop after verifying explicit consent and unique identity."""
         async with self._lock:
             if not req.explicit_consent_granted:
                 logger.warning(
@@ -39,12 +55,33 @@ class WorkerManager:
                 raise PermissionError("Explicit user permission is required to register a worker.")
 
             now = current_utc_time()
+
+            # Prevent duplicate worker ID conflicts from different hosts
+            if req.worker_id in self._workers:
+                existing = self._workers[req.worker_id]
+                # If existing worker is currently active on a different machine, reject conflict
+                if (
+                    existing.status not in (WorkerStatus.OFFLINE, WorkerStatus.EMERGENCY_STOPPED)
+                    and existing.hostname != req.hostname
+                ):
+                    logger.warning(
+                        f"Registration conflict for '{req.worker_id}': Already active on host '{existing.hostname}'."
+                    )
+                    raise ValueError(
+                        f"Worker ID conflict: Worker '{req.worker_id}' is already active on host '{existing.hostname}' "
+                        f"({existing.ip_address}). Each laptop must have a unique WORKER_ID."
+                    )
+                logger.info(
+                    f"Worker '{req.worker_id}' re-registering from host '{req.hostname}' (previous status: {existing.status.value})"
+                )
+
             worker_info = WorkerInfo(
                 worker_id=req.worker_id,
                 worker_name=req.worker_name,
                 hostname=req.hostname,
                 ip_address=req.ip_address,
                 status=WorkerStatus.ONLINE,
+                connection_status="CONNECTED",
                 last_heartbeat=now,
                 registered_at=now,
                 capabilities=req.capabilities,
@@ -96,6 +133,9 @@ class WorkerManager:
             worker.cpu_percent = hb.cpu_percent
             worker.memory_percent = hb.memory_percent
             worker.permission_active = hb.permission_active
+            worker.connection_status = "CONNECTED"
+            if hb.current_task_id:
+                worker.current_task_id = hb.current_task_id
 
             # Preserve EMERGENCY_STOPPED state if already stopped
             if worker.status != WorkerStatus.EMERGENCY_STOPPED:
@@ -167,12 +207,68 @@ class WorkerManager:
                 elapsed = (now - worker.last_heartbeat).total_seconds()
                 if elapsed > self._timeout_seconds:
                     worker.status = WorkerStatus.OFFLINE
+                    worker.connection_status = "DISCONNECTED"
                     stale_workers.append(wid)
                     logger.warning(
                         f"Worker '{wid}' marked OFFLINE: no heartbeat for {elapsed:.1f}s"
                     )
 
         return stale_workers
+
+    # --- Worker-Scoped Task Queue Methods ---
+
+    async def assign_task(self, req: TaskAssignmentRequest) -> TaskAssignmentResponse:
+        """Assign and queue a task specifically for one worker machine."""
+        async with self._lock:
+            if req.worker_id not in self._workers:
+                raise ValueError(f"Target worker '{req.worker_id}' is not registered.")
+
+            task = TaskItem(
+                task_id=f"task-{uuid.uuid4().hex[:8]}",
+                worker_id=req.worker_id,
+                title=req.title,
+                description=req.description,
+                code_context=req.code_context,
+                status="pending",
+                created_at=current_utc_time(),
+            )
+
+            if req.worker_id not in self._worker_tasks:
+                self._worker_tasks[req.worker_id] = []
+            self._worker_tasks[req.worker_id].append(task)
+
+            logger.info(f"Task '{task.task_id}' assigned specifically to worker '{req.worker_id}'")
+            return TaskAssignmentResponse(
+                task_id=task.task_id,
+                worker_id=task.worker_id,
+                status="assigned",
+                created_at=task.created_at,
+                message=f"Task queued for worker '{req.worker_id}'",
+            )
+
+    async def poll_task_for_worker(self, worker_id: str) -> Optional[TaskItem]:
+        """Retrieve the next pending task assigned strictly to this worker.
+
+        Ensures workers cannot access or receive tasks assigned to another worker.
+        """
+        async with self._lock:
+            tasks = self._worker_tasks.get(worker_id, [])
+            for task in tasks:
+                if task.status == "pending":
+                    task.status = "in_progress"
+                    return task
+            return None
+
+    async def get_tasks_for_worker(self, worker_id: str) -> List[TaskItem]:
+        """List tasks assigned to a specific worker."""
+        async with self._lock:
+            return list(self._worker_tasks.get(worker_id, []))
+
+    async def clear_all(self) -> None:
+        """Reset state (useful for test isolation)."""
+        async with self._lock:
+            self._workers.clear()
+            self._worker_tasks.clear()
 
 
 # Global worker manager instance

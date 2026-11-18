@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.common.config import settings
 from src.common.logger import get_logger
 from src.controller.manager import worker_manager
-from src.controller.routes import health, tasks, workers
+from src.controller.routes import dashboard, health, tasks, workers
 
 logger = get_logger("Controller.Main")
 
@@ -70,6 +70,7 @@ def create_app() -> FastAPI:
     )
 
     # Include route modules
+    app.include_router(dashboard.router)
     app.include_router(health.router)
     app.include_router(workers.router)
     app.include_router(tasks.router)

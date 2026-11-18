@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--id", default=None, help="Worker ID (overrides WORKER_ID in .env)")
     parser.add_argument("--name", default=None, help="Worker Name (overrides WORKER_NAME in .env)")
     parser.add_argument("--controller", default=None, help="Controller URL (overrides CONTROLLER_URL in .env)")
+    parser.add_argument("--secret", default=None, help="Controller secret key (overrides CONTROLLER_SECRET_KEY in .env)")
 
     args = parser.parse_args()
 
@@ -28,6 +29,10 @@ def main():
         settings.worker_name = args.name
     if args.controller:
         settings.controller_url = args.controller
+    if args.secret:
+        clean_secret = args.secret.strip().strip("'\"")
+        settings.controller_secret_key = clean_secret
+        os.environ["CONTROLLER_SECRET_KEY"] = clean_secret
 
     logger.info(f"Launching Worker '{settings.worker_id}' targeting {settings.controller_url}...")
     sys.exit(run_desktop_app())

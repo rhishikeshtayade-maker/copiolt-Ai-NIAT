@@ -26,6 +26,10 @@ class WorkerRegistrationRequest(BaseModel):
         ...,
         description="Whether the user on this worker machine has explicitly consented to participate and capture permitted screen areas",
     )
+    auth_token: Optional[str] = Field(
+        default=None,
+        description="Shared secret token for authenticated registration",
+    )
     metadata: Dict[str, str] = Field(default_factory=dict)
 
 
@@ -52,6 +56,10 @@ class HeartbeatRequest(BaseModel):
         default=False,
         description="Indicates whether the user currently has screen capture permission toggled ON",
     )
+    auth_token: Optional[str] = Field(
+        default=None,
+        description="Shared secret token for authenticated heartbeat pulse",
+    )
 
 
 class HeartbeatResponse(BaseModel):
@@ -71,6 +79,10 @@ class WorkerInfo(BaseModel):
     hostname: str
     ip_address: Optional[str] = None
     status: WorkerStatus = WorkerStatus.REGISTERED
+    connection_status: str = Field(
+        default="CONNECTED",
+        description="Human-readable connection health: CONNECTED, RECONNECTING, or DISCONNECTED",
+    )
     last_heartbeat: datetime = Field(default_factory=current_utc_time)
     registered_at: datetime = Field(default_factory=current_utc_time)
     cpu_percent: Optional[float] = None
@@ -78,6 +90,7 @@ class WorkerInfo(BaseModel):
     capabilities: List[str] = Field(default_factory=list)
     permission_active: bool = False
     pending_command: WorkerCommand = WorkerCommand.NONE
+    current_task_id: Optional[str] = None
 
 
 class ScreenCaptureMetadata(BaseModel):
@@ -135,3 +148,91 @@ class AIAnalysisResponse(BaseModel):
     requires_student_review: bool = True
     auto_submission_permitted: bool = False
     analyzed_at: datetime = Field(default_factory=current_utc_time)
+
+
+class EdgeCase(BaseModel):
+    """A single edge case identified during problem analysis."""
+
+    description: str = Field(..., description="Description of the edge case")
+    example_input: Optional[str] = Field(default=None, description="Example input triggering this case")
+    expected_behavior: Optional[str] = Field(default=None, description="Expected output or behavior")
+
+
+class CodingAnalysisResult(BaseModel):
+    """Structured breakdown of a coding problem identified from a screenshot.
+
+    Returned by the AI engine after vision analysis of permitted screen content.
+    All fields require explicit student review before any action is taken.
+    """
+
+    # Problem identification
+    problem_title: str = Field(default="Untitled Problem", description="Short title of the visible coding problem")
+    problem_description: str = Field(default="", description="Full problem statement as read from the screen")
+    programming_language: Optional[str] = Field(default=None, description="Detected programming language")
+
+    # Constraints and I/O
+    constraints: List[str] = Field(default_factory=list, description="Extracted constraints and limits")
+    input_format: Optional[str] = Field(default=None, description="Expected input format")
+    output_format: Optional[str] = Field(default=None, description="Expected output format")
+    sample_inputs: List[str] = Field(default_factory=list, description="Visible sample input examples")
+    sample_outputs: List[str] = Field(default_factory=list, description="Visible sample output examples")
+
+    # Concepts and approach
+    relevant_concepts: List[str] = Field(default_factory=list, description="Data structures, algorithms, or concepts needed")
+    step_by_step_explanation: List[str] = Field(default_factory=list, description="Ordered reasoning steps towards a solution")
+
+    # Solution guidance
+    suggested_code: Optional[str] = Field(default=None, description="Example solution code for student review")
+    code_explanation: Optional[str] = Field(default=None, description="Line-by-line or block-level code walkthrough")
+
+    # Edge cases
+    edge_cases: List[EdgeCase] = Field(default_factory=list, description="Potential edge cases to consider")
+
+    # Confidence
+    confidence_note: Optional[str] = Field(
+        default=None,
+        description="AI confidence note, e.g. if the screenshot was partially obscured",
+    )
+
+    # Safety flags (always enforced)
+    requires_student_review: bool = Field(default=True, description="Always True: student must review before acting")
+    auto_submission_permitted: bool = Field(default=False, description="Always False: no automated submissions")
+
+
+class TaskItem(BaseModel):
+    """Worker-isolated coding task queued on the controller."""
+
+    task_id: str = Field(..., description="Unique task identifier")
+    worker_id: str = Field(..., description="Target worker ID (tasks are isolated to this worker)")
+    title: str = Field(..., description="Task title or problem name")
+    description: str = Field(..., description="Task details or problem statement")
+    code_context: Optional[str] = Field(default=None, description="Optional starter code or context")
+    status: str = Field(default="pending", description="Task lifecycle status (pending, completed, cancelled)")
+    created_at: datetime = Field(default_factory=current_utc_time)
+
+
+class TaskAssignmentRequest(BaseModel):
+    """Request payload to assign a task specifically to one worker."""
+
+    worker_id: str = Field(..., description="Worker ID to receive this task")
+    title: str = Field(..., min_length=2, max_length=256)
+    description: str = Field(..., min_length=2)
+    code_context: Optional[str] = None
+
+
+class TaskAssignmentResponse(BaseModel):
+    """Response confirming task assignment to a worker."""
+
+    task_id: str
+    worker_id: str
+    status: str = "assigned"
+    created_at: datetime = Field(default_factory=current_utc_time)
+    message: str = "Task successfully queued for worker"
+
+
+class TaskPollResponse(BaseModel):
+    """Response when a worker polls for its own pending tasks."""
+
+    worker_id: str
+    has_task: bool
+    task: Optional[TaskItem] = None

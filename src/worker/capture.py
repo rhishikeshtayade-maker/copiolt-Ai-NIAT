@@ -1,5 +1,6 @@
 """Screen capture service using MSS with explicit user permission guards."""
 
+import base64
 import io
 from typing import Optional, Tuple
 import mss
@@ -61,10 +62,12 @@ class ScreenCaptureService:
             f"EMERGENCY HALT triggered on screen capture for worker '{self.worker_id}'."
         )
 
-    def capture_frame_bytes(
-        self, monitor_index: int = 1, max_size: Optional[Tuple[int, int]] = (1280, 720)
-    ) -> Tuple[bytes, ScreenCaptureMetadata]:
-        """Capture the permitted screen content and return compressed PNG bytes with metadata.
+    def _grab_pil_image(
+        self,
+        monitor_index: int = 1,
+        max_size: Optional[Tuple[int, int]] = (1280, 720),
+    ) -> Image.Image:
+        """Grab screen pixels and return a PIL Image.
 
         Strictly enforces explicit user consent prior to reading any pixels.
         """
@@ -72,48 +75,91 @@ class ScreenCaptureService:
             raise PermissionError(
                 "Access Denied: Screen capture attempted without explicit user consent."
             )
-
         if not self._is_active:
             raise RuntimeError(
                 "Screen capture service is currently stopped. Activate service first."
             )
 
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            target_monitor = (
+                monitors[monitor_index]
+                if monitor_index < len(monitors)
+                else monitors[0]
+            )
+            sct_img = sct.grab(target_monitor)
+            img = Image.frombytes("RGB", (sct_img.width, sct_img.height), sct_img.rgb)
+
+            if max_size:
+                img.thumbnail(max_size, Image.Resampling.LANCZOS)
+
+            return img
+
+    def capture_frame_bytes(
+        self, monitor_index: int = 1, max_size: Optional[Tuple[int, int]] = (1280, 720)
+    ) -> Tuple[bytes, ScreenCaptureMetadata]:
+        """Capture the permitted screen content and return compressed PNG bytes with metadata.
+
+        Strictly enforces explicit user consent prior to reading any pixels.
+        """
         try:
-            with mss.mss() as sct:
-                # monitor 0 is all monitors combined; monitor 1 is primary monitor
-                monitors = sct.monitors
-                target_monitor = (
-                    monitors[monitor_index]
-                    if monitor_index < len(monitors)
-                    else monitors[0]
-                )
+            img = self._grab_pil_image(monitor_index, max_size)
 
-                sct_img = sct.grab(target_monitor)
+            buffer = io.BytesIO()
+            img.save(buffer, format="PNG", optimize=True)
+            png_bytes = buffer.getvalue()
 
-                # Convert to PIL Image
-                img = Image.frombytes("RGB", (sct_img.width, sct_img.height), sct_img.rgb)
+            metadata = ScreenCaptureMetadata(
+                worker_id=self.worker_id,
+                width=img.width,
+                height=img.height,
+                captured_at=current_utc_time(),
+                explicit_permission_verified=True,
+                format="PNG",
+                frame_size_bytes=len(png_bytes),
+            )
 
-                # Optional thumbnail/resizing for bandwidth efficiency
-                if max_size:
-                    img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            return png_bytes, metadata
 
-                # Save to PNG byte stream
-                buffer = io.BytesIO()
-                img.save(buffer, format="PNG", optimize=True)
-                png_bytes = buffer.getvalue()
-
-                metadata = ScreenCaptureMetadata(
-                    worker_id=self.worker_id,
-                    width=img.width,
-                    height=img.height,
-                    captured_at=current_utc_time(),
-                    explicit_permission_verified=True,
-                    format="PNG",
-                    frame_size_bytes=len(png_bytes),
-                )
-
-                return png_bytes, metadata
-
+        except (PermissionError, RuntimeError):
+            raise
         except Exception as e:
             logger.error(f"Failed to capture screen frame: {e}")
+            raise
+
+    def capture_jpeg_base64(
+        self,
+        monitor_index: int = 1,
+        max_size: Optional[Tuple[int, int]] = (1280, 720),
+        quality: int = 75,
+    ) -> Tuple[str, ScreenCaptureMetadata]:
+        """Capture and return base64 JPEG for AI vision API transmission.
+
+        JPEG is used instead of PNG to reduce payload size for API calls.
+        Strictly enforces explicit user consent prior to reading any pixels.
+        """
+        try:
+            img = self._grab_pil_image(monitor_index, max_size)
+
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=quality, optimize=True)
+            jpeg_bytes = buffer.getvalue()
+            b64_str = base64.b64encode(jpeg_bytes).decode("ascii")
+
+            metadata = ScreenCaptureMetadata(
+                worker_id=self.worker_id,
+                width=img.width,
+                height=img.height,
+                captured_at=current_utc_time(),
+                explicit_permission_verified=True,
+                format="JPEG",
+                frame_size_bytes=len(jpeg_bytes),
+            )
+
+            return b64_str, metadata
+
+        except (PermissionError, RuntimeError):
+            raise
+        except Exception as e:
+            logger.error(f"Failed to capture JPEG screen frame: {e}")
             raise
