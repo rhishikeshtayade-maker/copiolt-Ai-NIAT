@@ -1,8 +1,7 @@
 """Entrypoint for the NIAT CodePilot PySide6 Desktop Application."""
 
 import sys
-from PySide6.QtWidgets import QApplication
-from src.desktop.app import MainWindow
+from src.desktop.app import main as app_main
 from src.common.logger import get_logger
 
 logger = get_logger("Desktop.Main")
@@ -10,15 +9,7 @@ logger = get_logger("Desktop.Main")
 
 def main() -> int:
     """Run the PySide6 desktop interface."""
-    logger.info("Starting NIAT CodePilot Desktop Interface...")
-    app = QApplication(sys.argv)
-    app.setApplicationName("NIAT CodePilot")
-    app.setOrganizationName("NIAT")
-
-    window = MainWindow()
-    window.show()
-
-    return app.exec()
+    return app_main()
 
 
 if __name__ == "__main__":

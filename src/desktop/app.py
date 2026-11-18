@@ -12,11 +12,13 @@ Implements the Approved Premium UI & Computer-Use Agent:
 
 import asyncio
 import base64
+import sys
 import time
 from typing import Optional, Tuple
 from PySide6.QtCore import QByteArray, QDateTime, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -1114,3 +1116,60 @@ class MainWindow(QMainWindow):
             f"Keyboard code entry was halted:\n\n{error_message}\n\n"
             "Safety invariant preserved: Typing stops whenever editor focus changes or an error occurs.",
         )
+
+    def closeEvent(self, event) -> None:
+        """Ensure all background worker threads and timers stop cleanly on close."""
+        logger.info("Closing NIAT CodePilot Desktop Application...")
+        try:
+            self.preview_timer.stop()
+            self.observe_timer.stop()
+
+            if self.typing_thread and self.typing_thread.isRunning():
+                self.typing_thread.stop()
+                self.typing_thread.wait(1000)
+
+            if self.ai_thread and self.ai_thread.isRunning():
+                self.ai_thread.wait(1000)
+
+            if self.heartbeat_thread and self.heartbeat_thread.isRunning():
+                self.heartbeat_thread.stop()
+                self.heartbeat_thread.wait(1000)
+
+            self.capture_service.stop()
+
+            if self.practice_editor is not None:
+                self.practice_editor.close()
+        except Exception as e:
+            logger.warning(f"Error during clean shutdown: {e}")
+
+        try:
+            super().closeEvent(event)
+        except TypeError:
+            if hasattr(event, "accept"):
+                event.accept()
+
+
+def main() -> int:
+    """Entry point to run the PySide6 desktop interface for NIAT CodePilot Worker."""
+    logger.info("Initializing NIAT CodePilot Desktop Application...")
+    try:
+        # Reuse existing QApplication if already running (e.g. in test fixtures), otherwise create one
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication(sys.argv)
+
+        app.setApplicationName("NIAT CodePilot")
+        app.setOrganizationName("NIAT")
+
+        window = MainWindow()
+        window.show()
+
+        logger.info("NIAT CodePilot GUI event loop started.")
+        return app.exec()
+    except Exception as e:
+        logger.exception(f"Fatal error during NIAT CodePilot desktop application startup: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
